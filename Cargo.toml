@@ -1,0 +1,23 @@
+[package]
+name = "chromium-bridge"
+version = "0.1.0"
+edition = "2024"
+description = "CLI bridging agents to Chromium-based browsers via Chrome DevTools Protocol"
+license = "MIT"
+repository = "https://github.com/btakita/chromium-bridge"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json"] }
+tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+futures-util = "0.3"
+anyhow = "1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
