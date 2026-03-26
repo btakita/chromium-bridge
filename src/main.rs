@@ -1,9 +1,9 @@
 use anyhow::{Context, Result, bail};
 use base64::Engine;
+use cdpkit::CDP;
 use clap::{Parser, Subcommand};
-use futures_util::{SinkExt, StreamExt};
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use tokio_tungstenite::tungstenite::Message;
 
 #[derive(Parser)]
 #[command(name = "chromium-bridge", about = "Bridge agents to Chromium browsers via CDP")]
@@ -38,6 +38,9 @@ enum Command {
     Navigate {
         /// URL to open
         url: String,
+        /// Target tab index (default: first tab)
+        #[arg(long, default_value = "0")]
+        tab: usize,
     },
     /// Run JavaScript in the active tab
     Evaluate {
@@ -93,13 +96,6 @@ struct Tab {
     web_socket_debugger_url: String,
 }
 
-#[derive(Serialize)]
-struct CdpCommand {
-    id: u64,
-    method: String,
-    params: serde_json::Value,
-}
-
 fn base_url(cli: &Cli) -> String {
     format!("http://{}:{}", cli.host, cli.port)
 }
@@ -124,36 +120,26 @@ async fn get_tabs(cli: &Cli) -> Result<Vec<Tab>> {
     Ok(tabs)
 }
 
-async fn ws_command(
-    ws_url: &str,
-    method: &str,
-    params: serde_json::Value,
-) -> Result<serde_json::Value> {
-    let (mut ws, _) = tokio_tungstenite::connect_async(ws_url)
+/// Connect to a specific tab via cdpkit, creating a CDP session.
+async fn connect_to_tab(cli: &Cli, tab_index: usize) -> Result<(CDP, String)> {
+    let tabs = get_tabs(cli).await?;
+    let pages: Vec<&Tab> = tabs.iter().filter(|t| t.tab_type == "page").collect();
+    let tab = pages
+        .get(tab_index)
+        .context(format!("No tab at index {}", tab_index))?;
+
+    let cdp = CDP::connect(&format!("{}:{}", cli.host, cli.port))
         .await
-        .context("Failed to connect WebSocket to browser")?;
+        .context("Failed to connect CDP client")?;
 
-    let cmd = CdpCommand {
-        id: 1,
-        method: method.to_string(),
-        params,
-    };
-    ws.send(Message::Text(serde_json::to_string(&cmd)?.into()))
-        .await?;
+    // Attach to the specific tab's target
+    let attach = cdpkit::target::methods::AttachToTarget::new(&tab.id)
+        .with_flatten(true)
+        .send(&cdp, None)
+        .await
+        .context("Failed to attach to tab")?;
 
-    while let Some(msg) = ws.next().await {
-        let msg = msg?;
-        if let Message::Text(text) = msg {
-            let resp: serde_json::Value = serde_json::from_str(&text)?;
-            if resp.get("id") == Some(&serde_json::json!(1)) {
-                if let Some(error) = resp.get("error") {
-                    bail!("CDP error: {}", error);
-                }
-                return Ok(resp["result"].clone());
-            }
-        }
-    }
-    bail!("WebSocket closed without response")
+    Ok((cdp, attach.session_id))
 }
 
 async fn cmd_check(cli: &Cli) -> Result<()> {
@@ -190,20 +176,22 @@ async fn cmd_list(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_navigate(cli: &Cli, url: &str) -> Result<()> {
-    let tabs = get_tabs(cli).await?;
-    let pages: Vec<&Tab> = tabs.iter().filter(|t| t.tab_type == "page").collect();
-    let tab = pages.first().context("No open tabs")?;
+async fn cmd_navigate(cli: &Cli, url: &str, tab_index: usize) -> Result<()> {
+    let (cdp, session) = connect_to_tab(cli, tab_index).await?;
 
-    let result = ws_command(
-        &tab.web_socket_debugger_url,
-        "Page.navigate",
-        serde_json::json!({ "url": url }),
-    )
-    .await?;
+    // Enable page domain for load events
+    cdpkit::page::methods::Enable::new()
+        .send(&cdp, Some(&session))
+        .await?;
+
+    let result = cdpkit::page::methods::Navigate::new(url)
+        .send(&cdp, Some(&session))
+        .await?;
 
     if cli.json {
-        println!("{}", serde_json::to_string_pretty(&result)?);
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "frameId": result.frame_id,
+        }))?);
     } else {
         println!("Navigated to {}", url);
     }
@@ -211,34 +199,26 @@ async fn cmd_navigate(cli: &Cli, url: &str) -> Result<()> {
 }
 
 async fn cmd_evaluate(cli: &Cli, expression: &str, tab_index: usize) -> Result<()> {
-    let tabs = get_tabs(cli).await?;
-    let pages: Vec<&Tab> = tabs.iter().filter(|t| t.tab_type == "page").collect();
-    let tab = pages
-        .get(tab_index)
-        .context(format!("No tab at index {}", tab_index))?;
+    let (cdp, session) = connect_to_tab(cli, tab_index).await?;
 
-    let result = ws_command(
-        &tab.web_socket_debugger_url,
-        "Runtime.evaluate",
-        serde_json::json!({
-            "expression": expression,
-            "returnByValue": true,
-        }),
-    )
-    .await?;
+    let result = cdpkit::runtime::methods::Evaluate::new(expression)
+        .with_return_by_value(true)
+        .send(&cdp, Some(&session))
+        .await?;
 
     if cli.json {
-        println!("{}", serde_json::to_string_pretty(&result)?);
-    } else if let Some(value) = result.get("result").and_then(|r| r.get("value")) {
+        let json = serde_json::json!({
+            "type": result.result.type_,
+            "value": result.result.value,
+            "description": result.result.description,
+        });
+        println!("{}", serde_json::to_string_pretty(&json)?);
+    } else if let Some(value) = &result.result.value {
         match value {
             serde_json::Value::String(s) => println!("{}", s),
             other => println!("{}", other),
         }
-    } else if let Some(desc) = result
-        .get("result")
-        .and_then(|r| r.get("description"))
-        .and_then(|d| d.as_str())
-    {
+    } else if let Some(desc) = &result.result.description {
         println!("{}", desc);
     }
     Ok(())
@@ -250,50 +230,58 @@ async fn cmd_screenshot(
     output: Option<&str>,
     tab_index: usize,
 ) -> Result<()> {
-    let tabs = get_tabs(cli).await?;
-    let pages: Vec<&Tab> = tabs.iter().filter(|t| t.tab_type == "page").collect();
-    let tab = pages
-        .get(tab_index)
-        .context(format!("No tab at index {}", tab_index))?;
-    let ws_url = &tab.web_socket_debugger_url;
+    let (cdp, session) = connect_to_tab(cli, tab_index).await?;
 
     if let Some(url) = url {
-        ws_command(ws_url, "Page.navigate", serde_json::json!({ "url": url })).await?;
-        tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+        cdpkit::page::methods::Enable::new()
+            .send(&cdp, Some(&session))
+            .await?;
+
+        cdpkit::page::methods::Navigate::new(url)
+            .send(&cdp, Some(&session))
+            .await?;
+
+        // Wait for page load event
+        let mut events = cdpkit::page::events::LoadEventFired::subscribe(&cdp);
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            events.next(),
+        )
+        .await;
     }
 
-    let result = ws_command(
-        ws_url,
-        "Page.captureScreenshot",
-        serde_json::json!({ "format": "png" }),
-    )
-    .await?;
-
-    let data = result
-        .get("data")
-        .and_then(|d| d.as_str())
-        .context("No screenshot data in response")?;
+    let result = cdpkit::page::methods::CaptureScreenshot::new()
+        .send(&cdp, Some(&session))
+        .await?;
 
     if let Some(path) = output {
-        let bytes = base64::engine::general_purpose::STANDARD.decode(data)?;
+        let bytes = base64::engine::general_purpose::STANDARD.decode(&result.data)?;
         std::fs::write(path, bytes)?;
         eprintln!("Screenshot saved to {}", path);
     } else {
-        println!("{}", data);
+        println!("{}", result.data);
     }
     Ok(())
 }
 
 async fn cmd_markdown(cli: &Cli, url: &str, tab_index: usize) -> Result<()> {
-    let tabs = get_tabs(cli).await?;
-    let pages: Vec<&Tab> = tabs.iter().filter(|t| t.tab_type == "page").collect();
-    let tab = pages
-        .get(tab_index)
-        .context(format!("No tab at index {}", tab_index))?;
-    let ws_url = &tab.web_socket_debugger_url;
+    let (cdp, session) = connect_to_tab(cli, tab_index).await?;
 
-    ws_command(ws_url, "Page.navigate", serde_json::json!({ "url": url })).await?;
-    tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
+    cdpkit::page::methods::Enable::new()
+        .send(&cdp, Some(&session))
+        .await?;
+
+    cdpkit::page::methods::Navigate::new(url)
+        .send(&cdp, Some(&session))
+        .await?;
+
+    // Wait for page load event instead of fixed sleep
+    let mut events = cdpkit::page::events::LoadEventFired::subscribe(&cdp);
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        events.next(),
+    )
+    .await;
 
     let js = r#"
     (function() {
@@ -350,22 +338,13 @@ async fn cmd_markdown(cli: &Cli, url: &str, tab_index: usize) -> Result<()> {
     })()
     "#;
 
-    let result = ws_command(
-        ws_url,
-        "Runtime.evaluate",
-        serde_json::json!({
-            "expression": js,
-            "returnByValue": true,
-        }),
-    )
-    .await?;
+    let result = cdpkit::runtime::methods::Evaluate::new(js)
+        .with_return_by_value(true)
+        .send(&cdp, Some(&session))
+        .await?;
 
-    if let Some(value) = result
-        .get("result")
-        .and_then(|r| r.get("value"))
-        .and_then(|v| v.as_str())
-    {
-        println!("{}", value);
+    if let Some(serde_json::Value::String(md)) = &result.result.value {
+        println!("{}", md);
     } else {
         bail!("Failed to extract markdown from page");
     }
@@ -426,7 +405,7 @@ async fn main() -> Result<()> {
     match &cli.command {
         Command::Check => cmd_check(&cli).await,
         Command::List => cmd_list(&cli).await,
-        Command::Navigate { url } => cmd_navigate(&cli, url).await,
+        Command::Navigate { url, tab } => cmd_navigate(&cli, url, *tab).await,
         Command::Evaluate { expression, tab } => cmd_evaluate(&cli, expression, *tab).await,
         Command::Screenshot { url, output, tab } => {
             cmd_screenshot(&cli, url.as_deref(), output.as_deref(), *tab).await
