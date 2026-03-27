@@ -1,3 +1,36 @@
+//! # Module: main (chromium-bridge CLI)
+//!
+//! ## Spec
+//! - Entry point for the `chromium-bridge` binary; parses CLI with `clap` derive.
+//! - `Cli` struct holds global options (`--host`, `--port`, `--timeout`, `--json`)
+//!   and a `Command` subcommand enum.
+//! - Commands: `Check`, `List`, `Navigate`, `Evaluate`, `Screenshot`, `Markdown`, `Setup`.
+//! - CDP communication: HTTP (`/json/*`) for tab listing/version, WebSocket via `cdpkit`
+//!   for page-level commands (navigate, evaluate, screenshot).
+//! - `connect_to_tab` creates a cdpkit `CDP` client and attaches to a specific tab by index.
+//! - Screenshot and markdown commands use `LoadEventFired` event streaming for page load
+//!   detection instead of fixed delays.
+//! - `cmd_markdown` injects a DOM walker JS that converts page content to clean markdown.
+//! - `cmd_setup` detects installed Chromium browsers and checks debugging flag status.
+//!
+//! ## Agentic Contracts
+//! - All commands return `anyhow::Result<()>`; errors propagate to stderr.
+//! - `--json` flag produces machine-readable output on all commands; human-readable by default.
+//! - Tab index defaults to 0 (first page tab); `--tab` overrides.
+//! - CDP connection timeout is configurable via `--timeout` (default 5000ms).
+//! - Env vars `CHROMIUM_BRIDGE_HOST` and `CHROMIUM_BRIDGE_PORT` override defaults.
+//!
+//! ## Evals
+//! - check_responds: `chromium-bridge check` with live browser → prints OK + version
+//! - check_no_browser: `chromium-bridge check` with no browser → error message + exit 1
+//! - list_tabs: `chromium-bridge list` → enumerates open page tabs
+//! - list_json: `chromium-bridge list --json` → valid JSON array output
+//! - navigate_url: `chromium-bridge navigate <url>` → tab navigated, confirmation printed
+//! - evaluate_returns_value: `chromium-bridge evaluate "1+1"` → prints "2"
+//! - screenshot_file: `chromium-bridge screenshot --output /tmp/test.png` → PNG written
+//! - markdown_extraction: `chromium-bridge markdown <url>` → markdown string on stdout
+//! - setup_detects_browsers: `chromium-bridge setup` → lists installed Chromium browsers
+
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use cdpkit::CDP;
