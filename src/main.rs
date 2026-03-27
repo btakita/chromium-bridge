@@ -4,9 +4,10 @@
 //! - Entry point for the `chromium-bridge` binary; parses CLI with `clap` derive.
 //! - `Cli` struct holds global options (`--host`, `--port`, `--timeout`, `--json`)
 //!   and a `Command` subcommand enum.
-//! - Commands: `Check`, `List`, `Navigate`, `Evaluate`, `Screenshot`, `Markdown`, `Setup`.
+//! - Commands: `Check`, `List`, `Navigate`, `Evaluate`, `Screenshot`, `Markdown`, `Setup`,
+//!   `Click`, `Type`, `SelectTab`, `Wait`, `Snapshot`.
 //! - CDP communication: HTTP (`/json/*`) for tab listing/version, WebSocket via `cdpkit`
-//!   for page-level commands (navigate, evaluate, screenshot).
+//!   for page-level commands (navigate, evaluate, screenshot, input).
 //! - `connect_to_tab` creates a cdpkit `CDP` client and attaches to a specific tab by index.
 //! - Screenshot and markdown commands use `LoadEventFired` event streaming for page load
 //!   detection instead of fixed delays.
@@ -33,6 +34,12 @@
 //! - setup_detects_browsers: `chromium-bridge setup` → lists installed Chromium browsers
 //! - tab_by_url_pattern: `--tab linkedin` → selects tab whose URL contains "linkedin"
 //! - tab_ambiguous_error: `--tab` matches 3 tabs → error listing all matches
+//! - click_by_selector: `chromium-bridge click "button.submit"` → clicks element
+//! - type_into_element: `chromium-bridge type "input.search" "hello"` → types text
+//! - type_with_newlines: text with `\n\n` → Shift+Enter inserted between paragraphs
+//! - select_tab_by_pattern: `chromium-bridge select-tab linkedin` → activates matching tab
+//! - wait_for_selector: `chromium-bridge wait "div.loaded"` → waits until element exists
+//! - snapshot_ax_tree: `chromium-bridge snapshot` → prints accessibility tree
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
@@ -105,8 +112,64 @@ enum Command {
         #[arg(long, default_value = "0")]
         tab: String,
     },
+    /// Click an element by CSS selector
+    Click {
+        /// CSS selector for the element to click
+        selector: String,
+        /// Target tab: index number or URL substring pattern (default: 0)
+        #[arg(long, default_value = "0")]
+        tab: String,
+    },
+    /// Type text into a focused or selected element
+    Type {
+        /// CSS selector for the element to type into
+        selector: String,
+        /// Text to type (use \n for newlines in contenteditable; sends Shift+Enter)
+        text: String,
+        /// Target tab: index number or URL substring pattern (default: 0)
+        #[arg(long, default_value = "0")]
+        tab: String,
+    },
+    /// Activate a browser tab by index or URL/title pattern
+    SelectTab {
+        /// Tab selector: index number or URL/title substring pattern
+        selector: String,
+    },
+    /// Wait for a CSS selector to appear in the DOM
+    Wait {
+        /// CSS selector to wait for
+        selector: String,
+        /// Timeout in milliseconds (default: 10000)
+        #[arg(long, default_value = "10000")]
+        wait_timeout: u64,
+        /// Target tab: index number or URL substring pattern (default: 0)
+        #[arg(long, default_value = "0")]
+        tab: String,
+    },
+    /// Dump the page accessibility tree
+    Snapshot {
+        /// Maximum depth of the tree (default: unlimited)
+        #[arg(long)]
+        depth: Option<i64>,
+        /// Target tab: index number or URL substring pattern (default: 0)
+        #[arg(long, default_value = "0")]
+        tab: String,
+    },
+    /// Manage the Claude Code skill definition
+    Skill {
+        #[command(subcommand)]
+        action: SkillAction,
+    },
     /// Configure browser for remote debugging
     Setup,
+}
+
+#[derive(Subcommand)]
+enum SkillAction {
+    /// Install SKILL.md to .claude/skills/chromium-bridge/
+    Install,
+    /// Check if installed skill matches this binary version
+    Check,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -415,6 +478,363 @@ async fn cmd_markdown(cli: &Cli, url: &str, tab_selector: &str) -> Result<()> {
     Ok(())
 }
 
+/// Resolve a CSS selector to DOM node coordinates, then click at center.
+async fn cmd_click(cli: &Cli, selector: &str, tab_selector: &str) -> Result<()> {
+    let (cdp, session) = connect_to_tab(cli, tab_selector).await?;
+
+    // Get the document root node ID
+    let doc = cdpkit::dom::methods::GetDocument::new()
+        .send(&cdp, Some(&session))
+        .await?;
+
+    // Find the element by CSS selector
+    let result = cdpkit::dom::methods::QuerySelector::new(doc.root.node_id, selector)
+        .send(&cdp, Some(&session))
+        .await
+        .context(format!("No element matching selector '{}'", selector))?;
+
+    if result.node_id == 0 {
+        bail!("No element matching selector '{}'", selector);
+    }
+
+    // Get the element's box model for coordinates
+    let box_model = cdpkit::dom::methods::GetBoxModel::new()
+        .with_node_id(result.node_id)
+        .send(&cdp, Some(&session))
+        .await
+        .context("Failed to get element box model")?;
+
+    // Calculate center of the content quad: [x1,y1, x2,y2, x3,y3, x4,y4]
+    let q = &box_model.model.content;
+    let cx = (q[0] + q[2] + q[4] + q[6]) / 4.0;
+    let cy = (q[1] + q[3] + q[5] + q[7]) / 4.0;
+
+    // Dispatch mouse events: move, press, release
+    cdpkit::input::methods::DispatchMouseEvent::new("mouseMoved", cx, cy)
+        .send(&cdp, Some(&session))
+        .await?;
+    cdpkit::input::methods::DispatchMouseEvent::new("mousePressed", cx, cy)
+        .with_button(cdpkit::input::types::MouseButton::Left)
+        .with_click_count(1)
+        .send(&cdp, Some(&session))
+        .await?;
+    cdpkit::input::methods::DispatchMouseEvent::new("mouseReleased", cx, cy)
+        .with_button(cdpkit::input::types::MouseButton::Left)
+        .with_click_count(1)
+        .send(&cdp, Some(&session))
+        .await?;
+
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "selector": selector,
+            "x": cx,
+            "y": cy,
+        }))?);
+    } else {
+        println!("Clicked '{}' at ({:.0}, {:.0})", selector, cx, cy);
+    }
+    Ok(())
+}
+
+/// Focus an element and type text into it, with paragraph handling for contenteditable.
+async fn cmd_type(cli: &Cli, selector: &str, text: &str, tab_selector: &str) -> Result<()> {
+    let (cdp, session) = connect_to_tab(cli, tab_selector).await?;
+
+    // Get document root
+    let doc = cdpkit::dom::methods::GetDocument::new()
+        .send(&cdp, Some(&session))
+        .await?;
+
+    // Find and focus the target element
+    let result = cdpkit::dom::methods::QuerySelector::new(doc.root.node_id, selector)
+        .send(&cdp, Some(&session))
+        .await
+        .context(format!("No element matching selector '{}'", selector))?;
+
+    if result.node_id == 0 {
+        bail!("No element matching selector '{}'", selector);
+    }
+
+    cdpkit::dom::methods::Focus::new()
+        .with_node_id(result.node_id)
+        .send(&cdp, Some(&session))
+        .await
+        .context("Failed to focus element")?;
+
+    // Split text on double-newlines for paragraph handling.
+    // Between paragraphs, send Shift+Enter (line break without submit).
+    let paragraphs: Vec<&str> = text.split("\n\n").collect();
+
+    for (i, paragraph) in paragraphs.iter().enumerate() {
+        if !paragraph.is_empty() {
+            cdpkit::input::methods::InsertText::new(*paragraph)
+                .send(&cdp, Some(&session))
+                .await?;
+        }
+
+        if i < paragraphs.len() - 1 {
+            // Shift+Enter for line break (modifier 8 = Shift)
+            cdpkit::input::methods::DispatchKeyEvent::new("keyDown")
+                .with_key("Enter")
+                .with_code("Enter")
+                .with_text("\r")
+                .with_modifiers(8)
+                .with_windows_virtual_key_code(13)
+                .send(&cdp, Some(&session))
+                .await?;
+            cdpkit::input::methods::DispatchKeyEvent::new("keyUp")
+                .with_key("Enter")
+                .with_code("Enter")
+                .with_modifiers(8)
+                .with_windows_virtual_key_code(13)
+                .send(&cdp, Some(&session))
+                .await?;
+            // Second Shift+Enter for visual paragraph gap
+            cdpkit::input::methods::DispatchKeyEvent::new("keyDown")
+                .with_key("Enter")
+                .with_code("Enter")
+                .with_text("\r")
+                .with_modifiers(8)
+                .with_windows_virtual_key_code(13)
+                .send(&cdp, Some(&session))
+                .await?;
+            cdpkit::input::methods::DispatchKeyEvent::new("keyUp")
+                .with_key("Enter")
+                .with_code("Enter")
+                .with_modifiers(8)
+                .with_windows_virtual_key_code(13)
+                .send(&cdp, Some(&session))
+                .await?;
+        }
+    }
+
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "selector": selector,
+            "length": text.len(),
+            "paragraphs": paragraphs.len(),
+        }))?);
+    } else {
+        println!(
+            "Typed {} chars ({} paragraph{}) into '{}'",
+            text.len(),
+            paragraphs.len(),
+            if paragraphs.len() == 1 { "" } else { "s" },
+            selector
+        );
+    }
+    Ok(())
+}
+
+/// Activate a browser tab by bringing it to the foreground.
+async fn cmd_select_tab(cli: &Cli, selector: &str) -> Result<()> {
+    let tabs = get_tabs(cli).await?;
+    let pages: Vec<&Tab> = tabs.iter().filter(|t| t.tab_type == "page").collect();
+    let tab = resolve_tab(&pages, selector)?;
+
+    // Use the HTTP endpoint to activate the tab
+    let resp = client(cli)
+        .get(format!("{}/json/activate/{}", base_url(cli), tab.id))
+        .send()
+        .await
+        .context("Failed to activate tab")?;
+
+    if !resp.status().is_success() {
+        bail!("Failed to activate tab: HTTP {}", resp.status());
+    }
+
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "id": tab.id,
+            "title": tab.title,
+            "url": tab.url,
+        }))?);
+    } else {
+        println!("Activated: {} — {}", tab.title, tab.url);
+    }
+    Ok(())
+}
+
+/// Wait for a CSS selector to appear in the DOM by polling.
+async fn cmd_wait(cli: &Cli, selector: &str, timeout_ms: u64, tab_selector: &str) -> Result<()> {
+    let (cdp, session) = connect_to_tab(cli, tab_selector).await?;
+
+    let js = format!(
+        r#"document.querySelector({}) !== null"#,
+        serde_json::to_string(selector)?
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let poll_interval = std::time::Duration::from_millis(250);
+
+    loop {
+        let result = cdpkit::runtime::methods::Evaluate::new(&js)
+            .with_return_by_value(true)
+            .send(&cdp, Some(&session))
+            .await?;
+
+        if result.result.value == Some(serde_json::Value::Bool(true)) {
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                    "selector": selector,
+                    "found": true,
+                }))?);
+            } else {
+                println!("Found '{}'", selector);
+            }
+            return Ok(());
+        }
+
+        if std::time::Instant::now() >= deadline {
+            bail!("Timeout waiting for selector '{}' after {}ms", selector, timeout_ms);
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+/// Dump the accessibility tree for the page.
+async fn cmd_snapshot(cli: &Cli, depth: Option<i64>, tab_selector: &str) -> Result<()> {
+    let (cdp, session) = connect_to_tab(cli, tab_selector).await?;
+
+    let mut req = cdpkit::accessibility::methods::GetFullAxTree::new();
+    if let Some(d) = depth {
+        req = req.with_depth(d);
+    }
+
+    let result = req.send(&cdp, Some(&session)).await?;
+
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&result.nodes)?);
+    } else {
+        // Build a compact human-readable tree
+        for node in &result.nodes {
+            if node.ignored {
+                continue;
+            }
+            let role = node
+                .role
+                .as_ref()
+                .and_then(|v| v.value.as_ref())
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let name = node
+                .name
+                .as_ref()
+                .and_then(|v| v.value.as_ref())
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            if role == "none" || role == "generic" {
+                continue;
+            }
+
+            if name.is_empty() {
+                println!("[{}]", role);
+            } else {
+                let truncated = if name.len() > 80 {
+                    format!("{}…", &name[..80])
+                } else {
+                    name.to_string()
+                };
+                println!("[{}] {}", role, truncated);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The SKILL.md content bundled at build time.
+const BUNDLED_SKILL: &str = include_str!("../SKILL.md");
+
+/// Resolve the project root for skill installation.
+fn resolve_skill_root() -> std::path::PathBuf {
+    // Try git superproject first (handles submodule CWD)
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["rev-parse", "--show-superproject-working-tree"])
+        .output()
+    {
+        let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !root.is_empty() {
+            return std::path::PathBuf::from(root);
+        }
+    }
+    // Fall back to git toplevel
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+    {
+        let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !root.is_empty() {
+            return std::path::PathBuf::from(root);
+        }
+    }
+    // Fall back to CWD
+    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+}
+
+fn cmd_skill_install(cli: &Cli) -> Result<()> {
+    let root = resolve_skill_root();
+    let dir = root.join(".claude/skills/chromium-bridge");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("SKILL.md");
+
+    let already_current = path.exists()
+        && std::fs::read_to_string(&path)
+            .map(|existing| existing == BUNDLED_SKILL)
+            .unwrap_or(false);
+
+    if already_current {
+        if cli.json {
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                "path": path.display().to_string(),
+                "updated": false,
+            }))?);
+        } else {
+            println!("Skill already up to date: {}", path.display());
+        }
+    } else {
+        std::fs::write(&path, BUNDLED_SKILL)?;
+        if cli.json {
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                "path": path.display().to_string(),
+                "updated": true,
+            }))?);
+        } else {
+            println!("Skill installed: {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+fn cmd_skill_check(cli: &Cli) -> Result<()> {
+    let root = resolve_skill_root();
+    let path = root.join(".claude/skills/chromium-bridge/SKILL.md");
+
+    let up_to_date = path.exists()
+        && std::fs::read_to_string(&path)
+            .map(|existing| existing == BUNDLED_SKILL)
+            .unwrap_or(false);
+
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "path": path.display().to_string(),
+            "up_to_date": up_to_date,
+        }))?);
+    } else if up_to_date {
+        println!("Skill up to date: {}", path.display());
+    } else if path.exists() {
+        eprintln!("Skill outdated: {}", path.display());
+        eprintln!("Run: chromium-bridge skill install");
+        std::process::exit(1);
+    } else {
+        eprintln!("Skill not installed");
+        eprintln!("Run: chromium-bridge skill install");
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 fn cmd_setup() -> Result<()> {
     let browsers = [
         (
@@ -475,6 +895,23 @@ async fn main() -> Result<()> {
             cmd_screenshot(&cli, url.as_deref(), output.as_deref(), tab).await
         }
         Command::Markdown { url, tab } => cmd_markdown(&cli, url, tab).await,
+        Command::Click { selector, tab } => cmd_click(&cli, selector, tab).await,
+        Command::Type {
+            selector,
+            text,
+            tab,
+        } => cmd_type(&cli, selector, text, tab).await,
+        Command::SelectTab { selector } => cmd_select_tab(&cli, selector).await,
+        Command::Wait {
+            selector,
+            wait_timeout,
+            tab,
+        } => cmd_wait(&cli, selector, *wait_timeout, tab).await,
+        Command::Snapshot { depth, tab } => cmd_snapshot(&cli, *depth, tab).await,
+        Command::Skill { action } => match action {
+            SkillAction::Install => cmd_skill_install(&cli),
+            SkillAction::Check => cmd_skill_check(&cli),
+        },
         Command::Setup => cmd_setup(),
     }
 }
