@@ -16,7 +16,8 @@
 //! ## Agentic Contracts
 //! - All commands return `anyhow::Result<()>`; errors propagate to stderr.
 //! - `--json` flag produces machine-readable output on all commands; human-readable by default.
-//! - Tab index defaults to 0 (first page tab); `--tab` overrides.
+//! - `--tab` accepts an index (e.g., `0`) or URL/title substring pattern (e.g., `linkedin`).
+//!   Ambiguous patterns (multiple matches) produce an error listing matches.
 //! - CDP connection timeout is configurable via `--timeout` (default 5000ms).
 //! - Env vars `CHROMIUM_BRIDGE_HOST` and `CHROMIUM_BRIDGE_PORT` override defaults.
 //!
@@ -30,6 +31,8 @@
 //! - screenshot_file: `chromium-bridge screenshot --output /tmp/test.png` → PNG written
 //! - markdown_extraction: `chromium-bridge markdown <url>` → markdown string on stdout
 //! - setup_detects_browsers: `chromium-bridge setup` → lists installed Chromium browsers
+//! - tab_by_url_pattern: `--tab linkedin` → selects tab whose URL contains "linkedin"
+//! - tab_ambiguous_error: `--tab` matches 3 tabs → error listing all matches
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
@@ -71,17 +74,17 @@ enum Command {
     Navigate {
         /// URL to open
         url: String,
-        /// Target tab index (default: first tab)
+        /// Target tab: index number or URL substring pattern (default: 0)
         #[arg(long, default_value = "0")]
-        tab: usize,
+        tab: String,
     },
     /// Run JavaScript in the active tab
     Evaluate {
         /// JavaScript expression to evaluate
         expression: String,
-        /// Target tab index (default: first tab)
+        /// Target tab: index number or URL substring pattern (default: 0)
         #[arg(long, default_value = "0")]
-        tab: usize,
+        tab: String,
     },
     /// Capture a page screenshot
     Screenshot {
@@ -90,17 +93,17 @@ enum Command {
         /// Output file path (default: stdout as base64)
         #[arg(short, long)]
         output: Option<String>,
-        /// Target tab index (default: first tab)
+        /// Target tab: index number or URL substring pattern (default: 0)
         #[arg(long, default_value = "0")]
-        tab: usize,
+        tab: String,
     },
     /// Convert a web page to markdown
     Markdown {
         /// URL to convert
         url: String,
-        /// Target tab index (default: first tab)
+        /// Target tab: index number or URL substring pattern (default: 0)
         #[arg(long, default_value = "0")]
-        tab: usize,
+        tab: String,
     },
     /// Configure browser for remote debugging
     Setup,
@@ -153,13 +156,41 @@ async fn get_tabs(cli: &Cli) -> Result<Vec<Tab>> {
     Ok(tabs)
 }
 
+/// Resolve a tab selector: numeric index or URL substring match.
+fn resolve_tab<'a>(pages: &[&'a Tab], selector: &str) -> Result<&'a Tab> {
+    if let Ok(index) = selector.parse::<usize>() {
+        pages
+            .get(index)
+            .copied()
+            .context(format!("No tab at index {}", index))
+    } else {
+        let matches: Vec<&&Tab> = pages
+            .iter()
+            .filter(|t| t.url.contains(selector) || t.title.contains(selector))
+            .collect();
+        match matches.len() {
+            0 => bail!("No tab matching pattern '{}'", selector),
+            1 => Ok(matches[0]),
+            n => bail!(
+                "Pattern '{}' matched {} tabs. Be more specific:\n{}",
+                selector,
+                n,
+                matches
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| format!("  [{}] {} — {}", i, t.title, t.url))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        }
+    }
+}
+
 /// Connect to a specific tab via cdpkit, creating a CDP session.
-async fn connect_to_tab(cli: &Cli, tab_index: usize) -> Result<(CDP, String)> {
+async fn connect_to_tab(cli: &Cli, selector: &str) -> Result<(CDP, String)> {
     let tabs = get_tabs(cli).await?;
     let pages: Vec<&Tab> = tabs.iter().filter(|t| t.tab_type == "page").collect();
-    let tab = pages
-        .get(tab_index)
-        .context(format!("No tab at index {}", tab_index))?;
+    let tab = resolve_tab(&pages, selector)?;
 
     let cdp = CDP::connect(&format!("{}:{}", cli.host, cli.port))
         .await
@@ -209,8 +240,8 @@ async fn cmd_list(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_navigate(cli: &Cli, url: &str, tab_index: usize) -> Result<()> {
-    let (cdp, session) = connect_to_tab(cli, tab_index).await?;
+async fn cmd_navigate(cli: &Cli, url: &str, tab_selector: &str) -> Result<()> {
+    let (cdp, session) = connect_to_tab(cli, tab_selector).await?;
 
     // Enable page domain for load events
     cdpkit::page::methods::Enable::new()
@@ -231,8 +262,8 @@ async fn cmd_navigate(cli: &Cli, url: &str, tab_index: usize) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_evaluate(cli: &Cli, expression: &str, tab_index: usize) -> Result<()> {
-    let (cdp, session) = connect_to_tab(cli, tab_index).await?;
+async fn cmd_evaluate(cli: &Cli, expression: &str, tab_selector: &str) -> Result<()> {
+    let (cdp, session) = connect_to_tab(cli, tab_selector).await?;
 
     let result = cdpkit::runtime::methods::Evaluate::new(expression)
         .with_return_by_value(true)
@@ -261,9 +292,9 @@ async fn cmd_screenshot(
     cli: &Cli,
     url: Option<&str>,
     output: Option<&str>,
-    tab_index: usize,
+    tab_selector: &str,
 ) -> Result<()> {
-    let (cdp, session) = connect_to_tab(cli, tab_index).await?;
+    let (cdp, session) = connect_to_tab(cli, tab_selector).await?;
 
     if let Some(url) = url {
         cdpkit::page::methods::Enable::new()
@@ -297,8 +328,8 @@ async fn cmd_screenshot(
     Ok(())
 }
 
-async fn cmd_markdown(cli: &Cli, url: &str, tab_index: usize) -> Result<()> {
-    let (cdp, session) = connect_to_tab(cli, tab_index).await?;
+async fn cmd_markdown(cli: &Cli, url: &str, tab_selector: &str) -> Result<()> {
+    let (cdp, session) = connect_to_tab(cli, tab_selector).await?;
 
     cdpkit::page::methods::Enable::new()
         .send(&cdp, Some(&session))
@@ -438,12 +469,12 @@ async fn main() -> Result<()> {
     match &cli.command {
         Command::Check => cmd_check(&cli).await,
         Command::List => cmd_list(&cli).await,
-        Command::Navigate { url, tab } => cmd_navigate(&cli, url, *tab).await,
-        Command::Evaluate { expression, tab } => cmd_evaluate(&cli, expression, *tab).await,
+        Command::Navigate { url, tab } => cmd_navigate(&cli, url, tab).await,
+        Command::Evaluate { expression, tab } => cmd_evaluate(&cli, expression, tab).await,
         Command::Screenshot { url, output, tab } => {
-            cmd_screenshot(&cli, url.as_deref(), output.as_deref(), *tab).await
+            cmd_screenshot(&cli, url.as_deref(), output.as_deref(), tab).await
         }
-        Command::Markdown { url, tab } => cmd_markdown(&cli, url, *tab).await,
+        Command::Markdown { url, tab } => cmd_markdown(&cli, url, tab).await,
         Command::Setup => cmd_setup(),
     }
 }

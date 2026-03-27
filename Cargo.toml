@@ -18,7 +18,7 @@ futures = "0.3"
 anyhow = "1"
 
 [dev-dependencies]
-existence = { version = "0.4", path = "../existence-lang/existence" }
+existence = "0.4"
 
 [profile.release]
 opt-level = "z"
