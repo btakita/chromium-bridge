@@ -31,7 +31,11 @@ brave --remote-debugging-port=9222
 ## Install
 
 ```bash
+# From crates.io
 cargo install chromium-bridge
+
+# Or via install script (prebuilt binaries)
+curl -sSf https://raw.githubusercontent.com/btakita/chromium-bridge/main/install.sh | sh
 ```
 
 ## License

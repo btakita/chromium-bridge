@@ -70,10 +70,11 @@ Interactive setup wizard:
 
 - `tokio` — async runtime
 - `reqwest` — HTTP client for CDP REST API
-- `tokio-tungstenite` — WebSocket client for CDP commands
+- `cdpkit` — type-safe CDP client (auto-generated typed bindings for all CDP domains)
 - `clap` — CLI argument parsing
 - `serde` / `serde_json` — JSON serialization
 - `base64` — screenshot decoding
+- `futures` — event stream subscription
 
 ## Error Handling
 

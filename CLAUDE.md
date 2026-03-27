@@ -6,10 +6,14 @@ Rust CLI bridging agents to Chromium-based browsers via Chrome DevTools Protocol
 
 ```
 chromium-bridge/
+├── .github/
+│   └── workflows/
+│       └── release.yml  # Cross-platform CI release (4 targets)
 ├── src/
-│   └── main.rs       # CLI entry point + all commands
+│   └── main.rs          # CLI entry point + all commands
 ├── Cargo.toml
 ├── Makefile
+├── install.sh           # curl|sh installer
 ├── README.md
 ├── SPEC.md
 └── CLAUDE.md
