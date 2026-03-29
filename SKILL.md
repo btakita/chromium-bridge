@@ -80,6 +80,48 @@ chromium-bridge snapshot --tab messenger
 chromium-bridge snapshot --depth 5 --json
 ```
 
+## Chatbox Formatting
+
+When composing rich messages in browser chat apps, use `evaluate` with `innerHTML` to set formatted content. The `type` command only handles plain text with paragraph breaks.
+
+### Contenteditable fields (LinkedIn, Gmail, Slack, Messenger)
+
+Set content via `innerHTML` with `<p>` tags for paragraphs and `<strong>` for bold. Always dispatch an `input` event so the app registers the change.
+
+```bash
+chromium-bridge evaluate --tab messaging '
+var input = document.querySelector("div[contenteditable=true]");
+var lines = [
+  "<p><strong>Section header:</strong> paragraph text here.</p>",
+  "<p><br></p>",
+  "<p>Next paragraph.</p>"
+];
+input.innerHTML = lines.join("");
+input.dispatchEvent(new Event("input", {bubbles: true}));
+"done";
+'
+```
+
+**Platform notes:**
+- **LinkedIn messaging:** `<strong>` renders bold. `<p>` per line, `<p><br></p>` for blank lines. Selector: `div.msg-form__contenteditable[contenteditable=true]`
+- **Gmail compose:** `<b>` or `<strong>` for bold, `<i>` for italic. Selector: `div[aria-label="Message Body"][contenteditable=true]`
+- **Facebook Messenger:** contenteditable `div[role=textbox]`. Bold not supported in plain messages.
+- **General pattern:** Find the contenteditable element, set `innerHTML`, dispatch `input` event with `{bubbles: true}`
+
+### Clicking conversation items by name
+
+LinkedIn and similar chat lists use click handlers on `<li>` items, not `<a>` links. Use `evaluate` to find by heading text:
+
+```bash
+chromium-bridge evaluate --tab messaging '
+var h3 = Array.from(document.querySelectorAll("li h3"))
+  .find(h => h.textContent.trim() === "Contact Name");
+h3.scrollIntoView({block: "center"});
+h3.click();
+"clicked";
+'
+```
+
 ## Common Patterns
 
 ### Send a message in a chat app

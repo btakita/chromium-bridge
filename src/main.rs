@@ -5,7 +5,7 @@
 //! - `Cli` struct holds global options (`--host`, `--port`, `--timeout`, `--json`)
 //!   and a `Command` subcommand enum.
 //! - Commands: `Check`, `List`, `Navigate`, `Evaluate`, `Screenshot`, `Markdown`, `Setup`,
-//!   `Click`, `Type`, `SelectTab`, `Wait`, `Snapshot`.
+//!   `Click`, `Type`, `SelectTab`, `Wait`, `Snapshot`, `Skill`.
 //! - CDP communication: HTTP (`/json/*`) for tab listing/version, WebSocket via `cdpkit`
 //!   for page-level commands (navigate, evaluate, screenshot, input).
 //! - `connect_to_tab` creates a cdpkit `CDP` client and attaches to a specific tab by index.
@@ -13,6 +13,8 @@
 //!   detection instead of fixed delays.
 //! - `cmd_markdown` injects a DOM walker JS that converts page content to clean markdown.
 //! - `cmd_setup` detects installed Chromium browsers and checks debugging flag status.
+//! - `cmd_skill_install` writes the bundled SKILL.md (embedded via `include_str!`) to
+//!   `.claude/skills/chromium-bridge/SKILL.md` in the project root.
 //!
 //! ## Agentic Contracts
 //! - All commands return `anyhow::Result<()>`; errors propagate to stderr.
@@ -40,6 +42,8 @@
 //! - select_tab_by_pattern: `chromium-bridge select-tab linkedin` → activates matching tab
 //! - wait_for_selector: `chromium-bridge wait "div.loaded"` → waits until element exists
 //! - snapshot_ax_tree: `chromium-bridge snapshot` → prints accessibility tree
+//! - skill_install: `chromium-bridge skill install` → writes SKILL.md to project .claude/skills/
+//! - skill_check: `chromium-bridge skill check` → reports if installed version matches binary
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;

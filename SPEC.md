@@ -44,11 +44,29 @@ Captures a screenshot via WebSocket `Page.captureScreenshot`. If URL is provided
 ### `markdown <url>`
 Navigates to URL, extracts page content, converts to clean markdown. Uses `Readability`-style extraction via injected JS.
 
+### `click <selector>`
+Clicks an element by CSS selector. Resolves the element via `DOM.querySelector`, computes the center coordinates from the content quad via `DOM.getBoxModel`, and dispatches real mouse events (mouseMoved, mousePressed, mouseReleased) at those coordinates.
+
+### `type <selector> <text>`
+Types text into an element. Focuses the element via CSS selector, then sends text via CDP `Input.insertText`. Double-newlines (`\n\n`) are converted to Shift+Enter keypresses for paragraph breaks in contenteditable fields (LinkedIn, Gmail, Slack, Messenger).
+
+### `select-tab <pattern>`
+Activates a browser tab by bringing it to the foreground. Accepts a numeric index or substring pattern matching against URL or title. Uses HTTP `GET /json/activate/{tab_id}`.
+
+### `wait <selector>`
+Polls for a CSS selector to appear in the DOM. Default timeout: 10 seconds (`--wait-timeout <ms>`). Polls every 250ms.
+
+### `snapshot`
+Dumps the page accessibility tree via CDP `Accessibility.getFullAXTree`. Human-readable output shows `[role] name` for each node. Supports `--depth <n>` to limit tree depth and `--json` for full AXNode array.
+
+### `skill install`
+Installs the bundled SKILL.md to the project's `.claude/skills/chromium-bridge/` directory. Detects the project root via git superproject or toplevel. The SKILL.md is embedded at build time via `include_str!()`.
+
 ### `setup`
 Interactive setup wizard:
-1. Detects installed Chromium browsers
-2. Configures `--remote-debugging-port` in the appropriate flags file
-3. Verifies the port is responding after browser restart
+1. Detects installed Chromium browsers (Brave, Chrome, Chromium)
+2. Checks for `--remote-debugging-port` in the appropriate flags file
+3. Verifies the port is responding
 
 ## Configuration
 
