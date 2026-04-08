@@ -28,7 +28,7 @@ make build    # release build
 
 ## Domain Ontology
 
-Extends the base ontology from `~/.claude/philosophy/src/`.
+Extends the existence kernel vocabulary with domain-specific terms.
 
 | Term | chromium-bridge Context |
 |------|----------------------|
