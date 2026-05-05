@@ -57,7 +57,7 @@ Activates a browser tab by bringing it to the foreground. Accepts a numeric inde
 Polls for a CSS selector to appear in the DOM. Default timeout: 10 seconds (`--wait-timeout <ms>`). Polls every 250ms.
 
 ### `snapshot`
-Dumps the page accessibility tree via CDP `Accessibility.getFullAXTree`. Human-readable output shows `[role] name` for each node. Supports `--depth <n>` to limit tree depth and `--json` for full AXNode array.
+Dumps the page accessibility tree via CDP `Accessibility.getFullAXTree`. Human-readable output shows a tree of visible nodes with stable refs (`ref=dom:<backendDOMNodeId>` when available, otherwise `ref=ax:<nodeId>`). `--json` returns a normalized snapshot object with `ref`, `parentRef`, and `childRefs`; `--raw` preserves the original AXNode protocol array for low-level debugging. Supports `--depth <n>` to limit tree depth.
 
 ### `network list`
 Captures network traffic for a page load and prints a request summary. If `--url <url>` is provided, the command navigates there first; otherwise it reloads the target tab. Uses `Network.requestWillBeSent`, `Network.responseReceived`, `Network.loadingFinished`, and `Network.loadingFailed` to build a per-request view. `--capture-timeout <ms>` sets the hard stop, and `--idle-ms <ms>` ends capture after the page load goes idle.

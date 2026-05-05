@@ -78,11 +78,12 @@ chromium-bridge select-tab linkedin
 
 ## Snapshot
 
-Dumps the page accessibility tree. Human-readable output shows `[role] name` for each non-ignored, non-generic node. JSON mode returns the full AXNode array.
+Dumps the page accessibility tree. Human-readable output preserves tree shape and includes a stable `ref=` handle for each visible node. JSON mode returns a normalized snapshot object with `ref`, `parentRef`, and `childRefs`. Add `--raw` when you need the underlying AXNode protocol payload.
 
 ```bash
 chromium-bridge snapshot --tab messenger
 chromium-bridge snapshot --depth 5 --json
+chromium-bridge snapshot --depth 5 --json --raw
 ```
 
 ## Network

@@ -18,7 +18,7 @@ Works with **Brave**, **Chrome**, and **Chromium** — any browser that speaks C
 | `chromium-bridge type <selector> <text>` | Type text into an element |
 | `chromium-bridge select-tab <pattern>` | Activate a tab by index or pattern |
 | `chromium-bridge wait <selector>` | Wait for a CSS selector to appear |
-| `chromium-bridge snapshot` | Dump the page accessibility tree |
+| `chromium-bridge snapshot` | Dump the page accessibility tree with stable refs |
 | `chromium-bridge network list` | Reload or navigate and list captured network requests |
 | `chromium-bridge network inspect <matcher>` | Reload or navigate and inspect one matched request |
 | `chromium-bridge state save <name>` | Save cookies plus local/session storage |
@@ -28,6 +28,23 @@ Works with **Brave**, **Chrome**, and **Chromium** — any browser that speaks C
 | `chromium-bridge skill install` | Install SKILL.md to the project's Claude skills |
 
 All commands accept `--tab <index|pattern>` to target a specific tab, `--json` for machine-readable output, and `--timeout <ms>` to override the default 5s timeout.
+
+## Accessibility Snapshot
+
+Use `snapshot` when you need an agent-friendly view of the current page's accessibility tree.
+
+```bash
+# Human-readable tree with stable refs on each visible node
+chromium-bridge snapshot --tab messenger
+
+# Normalized JSON with ref / parentRef / childRefs
+chromium-bridge snapshot --depth 5 --json
+
+# Raw AXNode protocol payload for low-level debugging
+chromium-bridge snapshot --depth 5 --json --raw
+```
+
+Default text output skips ignored/generic wrappers but preserves tree shape and prints `ref=dom:<id>` (or `ref=ax:<nodeId>` when no DOM backend id is available). JSON mode returns a normalized object with stable refs so follow-up tooling can point back at the same element without depending on array position.
 
 ## Network Capture
 

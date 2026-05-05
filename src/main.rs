@@ -44,7 +44,9 @@
 //! - type_with_newlines: text with `\n\n` → Shift+Enter inserted between paragraphs
 //! - select_tab_by_pattern: `chromium-bridge select-tab linkedin` → activates matching tab
 //! - wait_for_selector: `chromium-bridge wait "div.loaded"` → waits until element exists
-//! - snapshot_ax_tree: `chromium-bridge snapshot` → prints accessibility tree
+//! - snapshot_ax_tree: `chromium-bridge snapshot` → prints accessibility tree with stable refs
+//! - snapshot_structured_json: `chromium-bridge snapshot --json` → emits normalized nodes with `ref`, `parentRef`, and `childRefs`
+//! - snapshot_raw_ax: `chromium-bridge snapshot --json --raw` → emits raw AXNode protocol objects
 //! - network_list_reload: `chromium-bridge network list --tab linkedin` → reloads tab and lists requests
 //! - network_inspect_match: `chromium-bridge network inspect graphql --tab linkedin` → reloads tab and prints matched request details
 //! - state_save_named: `chromium-bridge state save linkedin-auth --tab linkedin` → writes JSON snapshot
@@ -59,7 +61,7 @@ use cdpkit::CDP;
 use clap::{Parser, Subcommand};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -168,6 +170,9 @@ enum Command {
         /// Maximum depth of the tree (default: unlimited)
         #[arg(long)]
         depth: Option<i64>,
+        /// Emit the raw AXNode protocol payload instead of normalized snapshot JSON
+        #[arg(long)]
+        raw: bool,
         /// Target tab: index number or URL substring pattern (default: 0)
         #[arg(long, default_value = "0")]
         tab: String,
@@ -424,6 +429,54 @@ enum NetworkMatchKind {
     UrlPattern,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SnapshotOutput {
+    root_refs: Vec<String>,
+    node_count: usize,
+    nodes: Vec<SnapshotNodeOutput>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SnapshotNodeOutput {
+    #[serde(rename = "ref")]
+    ref_id: String,
+    ax_node_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backend_dom_node_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_ref: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    child_refs: Vec<String>,
+    ignored: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chrome_role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<SnapshotValueOutput>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    properties: BTreeMap<String, SnapshotValueOutput>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct SnapshotValueOutput {
+    #[serde(rename = "type")]
+    type_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    related_refs: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    related_text: Vec<String>,
+}
+
 fn base_url(cli: &Cli) -> String {
     format!("http://{}:{}", cli.host, cli.port)
 }
@@ -562,6 +615,225 @@ fn network_summary(entry: &CapturedNetworkRequest) -> NetworkRequestSummary {
         canceled: entry.canceled,
         error_text: entry.error_text.clone(),
         finished: entry.finished,
+    }
+}
+
+fn snapshot_ref(node: &cdpkit::accessibility::types::AXNode) -> String {
+    node.backend_dom_node_id
+        .map(|id| format!("dom:{id}"))
+        .unwrap_or_else(|| format!("ax:{}", node.node_id))
+}
+
+fn snapshot_ref_for_related_node(node: &cdpkit::accessibility::types::AXRelatedNode) -> String {
+    format!("dom:{}", node.backend_dom_node_id)
+}
+
+fn ax_value_text(value: &cdpkit::accessibility::types::AXValue) -> Option<String> {
+    match value.value.as_ref()? {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(text) => Some(text.clone()),
+        other => Some(other.to_string()),
+    }
+}
+
+fn ax_value_summary(value: &cdpkit::accessibility::types::AXValue) -> SnapshotValueOutput {
+    let related_refs = value
+        .related_nodes
+        .as_ref()
+        .map(|nodes| nodes.iter().map(snapshot_ref_for_related_node).collect())
+        .unwrap_or_default();
+    let related_text = value
+        .related_nodes
+        .as_ref()
+        .map(|nodes| {
+            nodes
+                .iter()
+                .filter_map(|node| node.text.clone())
+                .collect::<Vec<String>>()
+        })
+        .unwrap_or_default();
+
+    SnapshotValueOutput {
+        type_name: value.type_.as_ref().to_string(),
+        value: value.value.clone(),
+        related_refs,
+        related_text,
+    }
+}
+
+fn ax_value_string(value: Option<&cdpkit::accessibility::types::AXValue>) -> Option<String> {
+    value
+        .and_then(ax_value_text)
+        .filter(|text| !text.is_empty())
+}
+
+fn snapshot_role(node: &cdpkit::accessibility::types::AXNode) -> Option<String> {
+    ax_value_string(node.role.as_ref())
+}
+
+fn snapshot_primary_label(node: &cdpkit::accessibility::types::AXNode) -> Option<String> {
+    ax_value_string(node.name.as_ref())
+        .or_else(|| ax_value_string(node.value.as_ref()))
+        .or_else(|| ax_value_string(node.description.as_ref()))
+}
+
+fn should_display_snapshot_node(node: &cdpkit::accessibility::types::AXNode) -> bool {
+    if node.ignored {
+        return false;
+    }
+
+    !matches!(snapshot_role(node).as_deref(), Some("none" | "generic"))
+}
+
+fn snapshot_roots<'a>(
+    nodes: &'a [cdpkit::accessibility::types::AXNode],
+    node_index: &HashMap<&'a str, &'a cdpkit::accessibility::types::AXNode>,
+) -> Vec<&'a cdpkit::accessibility::types::AXNode> {
+    nodes
+        .iter()
+        .filter(|node| {
+            node.parent_id
+                .as_deref()
+                .and_then(|parent_id| node_index.get(parent_id).copied())
+                .is_none()
+        })
+        .collect()
+}
+
+fn build_snapshot_output(nodes: &[cdpkit::accessibility::types::AXNode]) -> SnapshotOutput {
+    let node_index = nodes
+        .iter()
+        .map(|node| (node.node_id.as_str(), node))
+        .collect::<HashMap<_, _>>();
+    let root_refs = snapshot_roots(nodes, &node_index)
+        .into_iter()
+        .map(snapshot_ref)
+        .collect::<Vec<_>>();
+
+    let normalized_nodes = nodes
+        .iter()
+        .map(|node| SnapshotNodeOutput {
+            ref_id: snapshot_ref(node),
+            ax_node_id: node.node_id.clone(),
+            backend_dom_node_id: node.backend_dom_node_id,
+            parent_ref: node
+                .parent_id
+                .as_deref()
+                .and_then(|parent_id| node_index.get(parent_id).copied())
+                .map(snapshot_ref),
+            child_refs: node
+                .child_ids
+                .as_ref()
+                .map(|child_ids| {
+                    child_ids
+                        .iter()
+                        .filter_map(|child_id| node_index.get(child_id.as_str()).copied())
+                        .map(snapshot_ref)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+            ignored: node.ignored,
+            role: snapshot_role(node),
+            chrome_role: ax_value_string(node.chrome_role.as_ref()),
+            name: ax_value_string(node.name.as_ref()),
+            description: ax_value_string(node.description.as_ref()),
+            value: node.value.as_ref().map(ax_value_summary),
+            properties: node
+                .properties
+                .as_ref()
+                .map(|properties| {
+                    properties
+                        .iter()
+                        .map(|property| {
+                            (
+                                property.name.as_ref().to_string(),
+                                ax_value_summary(&property.value),
+                            )
+                        })
+                        .collect::<BTreeMap<_, _>>()
+                })
+                .unwrap_or_default(),
+        })
+        .collect::<Vec<_>>();
+
+    SnapshotOutput {
+        root_refs,
+        node_count: normalized_nodes.len(),
+        nodes: normalized_nodes,
+    }
+}
+
+fn render_snapshot_text(nodes: &[cdpkit::accessibility::types::AXNode]) -> String {
+    let node_index = nodes
+        .iter()
+        .map(|node| (node.node_id.as_str(), node))
+        .collect::<HashMap<_, _>>();
+    let mut lines = Vec::new();
+    let mut visited = HashSet::new();
+
+    fn visit(
+        node: &cdpkit::accessibility::types::AXNode,
+        depth: usize,
+        node_index: &HashMap<&str, &cdpkit::accessibility::types::AXNode>,
+        visited: &mut HashSet<String>,
+        lines: &mut Vec<String>,
+    ) {
+        if !visited.insert(node.node_id.clone()) {
+            return;
+        }
+
+        let display = should_display_snapshot_node(node);
+        let next_depth = if display { depth + 1 } else { depth };
+
+        if display {
+            let role = snapshot_role(node).unwrap_or_else(|| "?".to_string());
+            let label = snapshot_primary_label(node)
+                .map(|text| {
+                    if text.len() > 80 {
+                        format!("{}…", &text[..80])
+                    } else {
+                        text
+                    }
+                })
+                .unwrap_or_default();
+            let suffix = if label.is_empty() {
+                String::new()
+            } else {
+                format!(" {label}")
+            };
+
+            lines.push(format!(
+                "{}[{}]{} (ref={})",
+                "  ".repeat(depth),
+                role,
+                suffix,
+                snapshot_ref(node)
+            ));
+        }
+
+        if let Some(child_ids) = node.child_ids.as_ref() {
+            for child_id in child_ids {
+                if let Some(child) = node_index.get(child_id.as_str()).copied() {
+                    visit(child, next_depth, node_index, visited, lines);
+                }
+            }
+        }
+    }
+
+    for root in snapshot_roots(nodes, &node_index) {
+        visit(root, 0, &node_index, &mut visited, &mut lines);
+    }
+
+    for node in nodes {
+        if !visited.contains(node.node_id.as_str()) {
+            visit(node, 0, &node_index, &mut visited, &mut lines);
+        }
+    }
+
+    if lines.is_empty() {
+        "No visible accessibility nodes.".to_string()
+    } else {
+        lines.join("\n")
     }
 }
 
@@ -1506,7 +1778,7 @@ async fn cmd_wait(cli: &Cli, selector: &str, timeout_ms: u64, tab_selector: &str
 }
 
 /// Dump the accessibility tree for the page.
-async fn cmd_snapshot(cli: &Cli, depth: Option<i64>, tab_selector: &str) -> Result<()> {
+async fn cmd_snapshot(cli: &Cli, depth: Option<i64>, raw: bool, tab_selector: &str) -> Result<()> {
     let (cdp, session) = connect_to_tab(cli, tab_selector).await?;
 
     let mut req = cdpkit::accessibility::methods::GetFullAxTree::new();
@@ -1517,41 +1789,16 @@ async fn cmd_snapshot(cli: &Cli, depth: Option<i64>, tab_selector: &str) -> Resu
     let result = req.send(&cdp, Some(&session)).await?;
 
     if cli.json {
-        println!("{}", serde_json::to_string_pretty(&result.nodes)?);
-    } else {
-        // Build a compact human-readable tree
-        for node in &result.nodes {
-            if node.ignored {
-                continue;
-            }
-            let role = node
-                .role
-                .as_ref()
-                .and_then(|v| v.value.as_ref())
-                .and_then(|v| v.as_str())
-                .unwrap_or("?");
-            let name = node
-                .name
-                .as_ref()
-                .and_then(|v| v.value.as_ref())
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-
-            if role == "none" || role == "generic" {
-                continue;
-            }
-
-            if name.is_empty() {
-                println!("[{}]", role);
-            } else {
-                let truncated = if name.len() > 80 {
-                    format!("{}…", &name[..80])
-                } else {
-                    name.to_string()
-                };
-                println!("[{}] {}", role, truncated);
-            }
+        if raw {
+            println!("{}", serde_json::to_string_pretty(&result.nodes)?);
+        } else {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&build_snapshot_output(&result.nodes))?
+            );
         }
+    } else {
+        println!("{}", render_snapshot_text(&result.nodes));
     }
     Ok(())
 }
@@ -2202,6 +2449,130 @@ mod tests {
         assert!(body.was_base64_encoded);
         assert!(!body.truncated);
     }
+
+    fn ax_string(value: &str) -> cdpkit::accessibility::types::AXValue {
+        cdpkit::accessibility::types::AXValue {
+            type_: cdpkit::accessibility::types::AXValueType::String,
+            value: Some(serde_json::Value::String(value.to_string())),
+            related_nodes: None,
+            sources: None,
+        }
+    }
+
+    fn ax_bool(value: bool) -> cdpkit::accessibility::types::AXValue {
+        cdpkit::accessibility::types::AXValue {
+            type_: cdpkit::accessibility::types::AXValueType::Boolean,
+            value: Some(serde_json::Value::Bool(value)),
+            related_nodes: None,
+            sources: None,
+        }
+    }
+
+    #[test]
+    fn snapshot_output_prefers_backend_dom_refs_and_preserves_relationships() {
+        let nodes = vec![
+            cdpkit::accessibility::types::AXNode {
+                node_id: "root".to_string(),
+                ignored: false,
+                ignored_reasons: None,
+                role: Some(ax_string("RootWebArea")),
+                chrome_role: None,
+                name: Some(ax_string("Inbox")),
+                description: None,
+                value: None,
+                properties: None,
+                parent_id: None,
+                child_ids: Some(vec!["child".to_string()]),
+                backend_dom_node_id: Some(101),
+                frame_id: None,
+            },
+            cdpkit::accessibility::types::AXNode {
+                node_id: "child".to_string(),
+                ignored: false,
+                ignored_reasons: None,
+                role: Some(ax_string("button")),
+                chrome_role: None,
+                name: Some(ax_string("Compose")),
+                description: None,
+                value: None,
+                properties: Some(vec![cdpkit::accessibility::types::AXProperty {
+                    name: cdpkit::accessibility::types::AXPropertyName::Focused,
+                    value: ax_bool(true),
+                }]),
+                parent_id: Some("root".to_string()),
+                child_ids: None,
+                backend_dom_node_id: Some(202),
+                frame_id: None,
+            },
+        ];
+
+        let snapshot = build_snapshot_output(&nodes);
+        assert_eq!(snapshot.root_refs, vec!["dom:101"]);
+        assert_eq!(snapshot.nodes[0].child_refs, vec!["dom:202"]);
+        assert_eq!(snapshot.nodes[1].parent_ref.as_deref(), Some("dom:101"));
+        assert_eq!(snapshot.nodes[1].ref_id, "dom:202");
+        assert_eq!(
+            snapshot.nodes[1].properties["focused"].value,
+            Some(serde_json::Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn snapshot_text_skips_generic_wrappers_and_keeps_refs() {
+        let nodes = vec![
+            cdpkit::accessibility::types::AXNode {
+                node_id: "root".to_string(),
+                ignored: false,
+                ignored_reasons: None,
+                role: Some(ax_string("RootWebArea")),
+                chrome_role: None,
+                name: Some(ax_string("Inbox")),
+                description: None,
+                value: None,
+                properties: None,
+                parent_id: None,
+                child_ids: Some(vec!["wrapper".to_string()]),
+                backend_dom_node_id: Some(101),
+                frame_id: None,
+            },
+            cdpkit::accessibility::types::AXNode {
+                node_id: "wrapper".to_string(),
+                ignored: false,
+                ignored_reasons: None,
+                role: Some(ax_string("generic")),
+                chrome_role: None,
+                name: None,
+                description: None,
+                value: None,
+                properties: None,
+                parent_id: Some("root".to_string()),
+                child_ids: Some(vec!["child".to_string()]),
+                backend_dom_node_id: Some(202),
+                frame_id: None,
+            },
+            cdpkit::accessibility::types::AXNode {
+                node_id: "child".to_string(),
+                ignored: false,
+                ignored_reasons: None,
+                role: Some(ax_string("button")),
+                chrome_role: None,
+                name: Some(ax_string("Compose")),
+                description: None,
+                value: None,
+                properties: None,
+                parent_id: Some("wrapper".to_string()),
+                child_ids: None,
+                backend_dom_node_id: Some(303),
+                frame_id: None,
+            },
+        ];
+
+        let rendered = render_snapshot_text(&nodes);
+        assert_eq!(
+            rendered,
+            "[RootWebArea] Inbox (ref=dom:101)\n  [button] Compose (ref=dom:303)"
+        );
+    }
 }
 
 #[tokio::main]
@@ -2228,7 +2599,7 @@ async fn main() -> Result<()> {
             wait_timeout,
             tab,
         } => cmd_wait(&cli, selector, *wait_timeout, tab).await,
-        Command::Snapshot { depth, tab } => cmd_snapshot(&cli, *depth, tab).await,
+        Command::Snapshot { depth, raw, tab } => cmd_snapshot(&cli, *depth, *raw, tab).await,
         Command::Network { action } => match action {
             NetworkAction::List {
                 url,
