@@ -110,6 +110,12 @@ Interactive setup wizard:
 - `base64` — screenshot decoding
 - `futures` — event stream subscription
 
+## Distribution
+
+- `cargo install chromium-bridge` installs from crates.io
+- `curl -sSf https://raw.githubusercontent.com/btakita/chromium-bridge/main/install.sh | sh` installs the latest compatible prebuilt release asset directly from GitHub Releases
+- `brew tap btakita/tap && brew install chromium-bridge` installs the tagged release binaries through the `btakita/homebrew-tap` Homebrew tap on macOS/Linux (`x86_64` and `aarch64`)
+
 ## Error Handling
 
 - Connection refused → "Browser not responding on {host}:{port}. Is remote debugging enabled?"

@@ -92,12 +92,18 @@ brave --remote-debugging-port=9222
 ## Install
 
 ```bash
+# From Homebrew
+brew tap btakita/tap
+brew install chromium-bridge
+
 # From crates.io
 cargo install chromium-bridge
 
 # Or via install script (prebuilt binaries)
 curl -sSf https://raw.githubusercontent.com/btakita/chromium-bridge/main/install.sh | sh
 ```
+
+The Homebrew tap ships prebuilt binaries from tagged GitHub releases for macOS and Linux on `x86_64` and `aarch64`.
 
 ## License
 
