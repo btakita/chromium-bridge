@@ -59,6 +59,12 @@ Polls for a CSS selector to appear in the DOM. Default timeout: 10 seconds (`--w
 ### `snapshot`
 Dumps the page accessibility tree via CDP `Accessibility.getFullAXTree`. Human-readable output shows `[role] name` for each node. Supports `--depth <n>` to limit tree depth and `--json` for full AXNode array.
 
+### `network list`
+Captures network traffic for a page load and prints a request summary. If `--url <url>` is provided, the command navigates there first; otherwise it reloads the target tab. Uses `Network.requestWillBeSent`, `Network.responseReceived`, `Network.loadingFinished`, and `Network.loadingFailed` to build a per-request view. `--capture-timeout <ms>` sets the hard stop, and `--idle-ms <ms>` ends capture after the page load goes idle.
+
+### `network inspect <matcher>`
+Captures network traffic for a page load, selects a single request by exact request id or URL substring, and prints request/response details. Response bodies are fetched via `Network.getResponseBody`; request bodies use `Network.getRequestPostData` when available. Text-like responses are decoded to UTF-8, and binary payloads stay base64.
+
 ### `state save <name>`
 Captures repeatable browser state for the target tab. Saves cookies applicable to the current page plus `localStorage` and `sessionStorage` for the current origin into a JSON snapshot. Named snapshots default to `~/.config/chromium-bridge/states/<name>.json`; `--path` can override the file location.
 

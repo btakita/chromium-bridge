@@ -19,6 +19,8 @@ Works with **Brave**, **Chrome**, and **Chromium** — any browser that speaks C
 | `chromium-bridge select-tab <pattern>` | Activate a tab by index or pattern |
 | `chromium-bridge wait <selector>` | Wait for a CSS selector to appear |
 | `chromium-bridge snapshot` | Dump the page accessibility tree |
+| `chromium-bridge network list` | Reload or navigate and list captured network requests |
+| `chromium-bridge network inspect <matcher>` | Reload or navigate and inspect one matched request |
 | `chromium-bridge state save <name>` | Save cookies plus local/session storage |
 | `chromium-bridge state load <name>` | Restore cookies plus local/session storage |
 | `chromium-bridge state list` | List saved state snapshots |
@@ -26,6 +28,20 @@ Works with **Brave**, **Chrome**, and **Chromium** — any browser that speaks C
 | `chromium-bridge skill install` | Install SKILL.md to the project's Claude skills |
 
 All commands accept `--tab <index|pattern>` to target a specific tab, `--json` for machine-readable output, and `--timeout <ms>` to override the default 5s timeout.
+
+## Network Capture
+
+Use the `network` command family when you need request-level visibility during a page load.
+
+```bash
+# Reload the current tab and print captured requests
+chromium-bridge network list --tab linkedin
+
+# Navigate to a URL, then inspect the last matching request in detail
+chromium-bridge network inspect graphql --url https://www.linkedin.com/feed/ --tab linkedin
+```
+
+`network list` and `network inspect` capture requests within a single CDP session so response bodies remain available for inspection. If `--url` is omitted, the command reloads the target tab. Use `--capture-timeout <ms>` and `--idle-ms <ms>` when heavy pages need a longer capture window.
 
 ## Persistent State
 

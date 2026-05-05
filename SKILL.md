@@ -17,6 +17,8 @@ CLI for browser automation via Chrome DevTools Protocol (CDP). Direct WebSocket 
 | `select-tab '<pattern>'` | Activate a tab by index or pattern |
 | `wait '<selector>'` | Wait for a CSS selector to appear |
 | `snapshot` | Dump the page accessibility tree |
+| `network list` | Reload or navigate and list captured network requests |
+| `network inspect '<matcher>'` | Reload or navigate and inspect one matched request |
 | `state save <name>` | Save cookies plus local/session storage |
 | `state load <name>` | Restore cookies plus local/session storage |
 | `state list` | List saved state snapshots |
@@ -82,6 +84,20 @@ Dumps the page accessibility tree. Human-readable output shows `[role] name` for
 chromium-bridge snapshot --tab messenger
 chromium-bridge snapshot --depth 5 --json
 ```
+
+## Network
+
+Capture network traffic for a page load when you need request ids, headers, status codes, or response bodies.
+
+```bash
+# Reload the current tab and print the captured requests
+chromium-bridge network list --tab linkedin
+
+# Navigate first, then inspect the last matching request
+chromium-bridge network inspect graphql --url https://www.linkedin.com/feed/ --tab linkedin
+```
+
+If `--url` is omitted, the command reloads the target tab. Use `--capture-timeout` and `--idle-ms` on heavy pages that keep loading after first paint.
 
 ## State
 

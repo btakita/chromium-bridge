@@ -5,7 +5,7 @@
 //! - `Cli` struct holds global options (`--host`, `--port`, `--timeout`, `--json`)
 //!   and a `Command` subcommand enum.
 //! - Commands: `Check`, `List`, `Navigate`, `Evaluate`, `Screenshot`, `Markdown`, `Setup`,
-//!   `Click`, `Type`, `SelectTab`, `Wait`, `Snapshot`, `State`, `Skill`.
+//!   `Click`, `Type`, `SelectTab`, `Wait`, `Snapshot`, `Network`, `State`, `Skill`.
 //! - CDP communication: HTTP (`/json/*`) for tab listing/version, WebSocket via `cdpkit`
 //!   for page-level commands (navigate, evaluate, screenshot, input).
 //! - `connect_to_tab` creates a cdpkit `CDP` client and attaches to a specific tab by index.
@@ -45,6 +45,8 @@
 //! - select_tab_by_pattern: `chromium-bridge select-tab linkedin` → activates matching tab
 //! - wait_for_selector: `chromium-bridge wait "div.loaded"` → waits until element exists
 //! - snapshot_ax_tree: `chromium-bridge snapshot` → prints accessibility tree
+//! - network_list_reload: `chromium-bridge network list --tab linkedin` → reloads tab and lists requests
+//! - network_inspect_match: `chromium-bridge network inspect graphql --tab linkedin` → reloads tab and prints matched request details
 //! - state_save_named: `chromium-bridge state save linkedin-auth --tab linkedin` → writes JSON snapshot
 //! - state_load_named: `chromium-bridge state load linkedin-auth --tab linkedin` → restores cookies + storage
 //! - state_list: `chromium-bridge state list` → enumerates named snapshots
@@ -57,7 +59,7 @@ use cdpkit::CDP;
 use clap::{Parser, Subcommand};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -170,6 +172,11 @@ enum Command {
         #[arg(long, default_value = "0")]
         tab: String,
     },
+    /// Capture and inspect network requests for a page load
+    Network {
+        #[command(subcommand)]
+        action: NetworkAction,
+    },
     /// Save or restore persistent browser state snapshots
     State {
         #[command(subcommand)]
@@ -190,6 +197,48 @@ enum SkillAction {
     Install,
     /// Check if installed skill matches this binary version
     Check,
+}
+
+#[derive(Subcommand)]
+enum NetworkAction {
+    /// Reload or navigate a tab, then list captured network requests
+    List {
+        /// Optional URL to navigate to before capture; otherwise reloads the target tab
+        #[arg(long)]
+        url: Option<String>,
+        /// Capture timeout in milliseconds (default: 15000)
+        #[arg(long, default_value = "15000")]
+        capture_timeout: u64,
+        /// Stop after this many idle milliseconds following page load (default: 750)
+        #[arg(long, default_value = "750")]
+        idle_ms: u64,
+        /// Maximum number of requests to print
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Target tab: index number or URL substring pattern (default: 0)
+        #[arg(long, default_value = "0")]
+        tab: String,
+    },
+    /// Reload or navigate a tab, then inspect one matched request in detail
+    Inspect {
+        /// Exact request id or URL substring to inspect
+        matcher: String,
+        /// Optional URL to navigate to before capture; otherwise reloads the target tab
+        #[arg(long)]
+        url: Option<String>,
+        /// Capture timeout in milliseconds (default: 15000)
+        #[arg(long, default_value = "15000")]
+        capture_timeout: u64,
+        /// Stop after this many idle milliseconds following page load (default: 750)
+        #[arg(long, default_value = "750")]
+        idle_ms: u64,
+        /// Maximum number of characters to print from the response body (0 = unlimited)
+        #[arg(long, default_value = "4000")]
+        body_limit: usize,
+        /// Target tab: index number or URL substring pattern (default: 0)
+        #[arg(long, default_value = "0")]
+        tab: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -279,6 +328,100 @@ struct PageStorageSnapshot {
 struct StateListEntry {
     name: String,
     path: String,
+}
+
+#[derive(Debug, Clone)]
+struct CapturedNetworkRequest {
+    request_id: String,
+    document_url: String,
+    url: String,
+    method: String,
+    resource_type: Option<String>,
+    initiator_type: String,
+    initiator_url: Option<String>,
+    request_headers: serde_json::Value,
+    has_post_data: bool,
+    post_data: Option<String>,
+    response_status: Option<i64>,
+    response_status_text: Option<String>,
+    response_headers: Option<serde_json::Value>,
+    mime_type: Option<String>,
+    protocol: Option<String>,
+    remote_ip_address: Option<String>,
+    remote_port: Option<i64>,
+    from_disk_cache: bool,
+    from_service_worker: bool,
+    encoded_data_length: Option<f64>,
+    failed: bool,
+    canceled: bool,
+    error_text: Option<String>,
+    finished: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NetworkRequestSummary {
+    request_id: String,
+    document_url: String,
+    url: String,
+    method: String,
+    resource_type: Option<String>,
+    initiator_type: String,
+    initiator_url: Option<String>,
+    status: Option<i64>,
+    status_text: Option<String>,
+    mime_type: Option<String>,
+    protocol: Option<String>,
+    remote_ip_address: Option<String>,
+    remote_port: Option<i64>,
+    from_disk_cache: bool,
+    from_service_worker: bool,
+    encoded_data_length: Option<f64>,
+    failed: bool,
+    canceled: bool,
+    error_text: Option<String>,
+    finished: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NetworkListOutput {
+    trigger: String,
+    request_count: usize,
+    requests: Vec<NetworkRequestSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NetworkBodyOutput {
+    content: String,
+    encoding: String,
+    was_base64_encoded: bool,
+    truncated: bool,
+    original_length: usize,
+    decoded_byte_length: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NetworkInspectOutput {
+    trigger: String,
+    matcher: String,
+    matched_by: String,
+    matched_count: usize,
+    request: NetworkRequestSummary,
+    request_headers: serde_json::Value,
+    response_headers: Option<serde_json::Value>,
+    request_post_data: Option<String>,
+    request_post_data_error: Option<String>,
+    response_body: Option<NetworkBodyOutput>,
+    response_body_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum NetworkMatchKind {
+    RequestId,
+    UrlPattern,
 }
 
 fn base_url(cli: &Cli) -> String {
@@ -395,6 +538,379 @@ fn cookie_to_param(cookie: cdpkit::network::types::Cookie) -> cdpkit::network::t
         source_port: Some(cookie.source_port),
         partition_key: cookie.partition_key,
     }
+}
+
+fn network_summary(entry: &CapturedNetworkRequest) -> NetworkRequestSummary {
+    NetworkRequestSummary {
+        request_id: entry.request_id.clone(),
+        document_url: entry.document_url.clone(),
+        url: entry.url.clone(),
+        method: entry.method.clone(),
+        resource_type: entry.resource_type.clone(),
+        initiator_type: entry.initiator_type.clone(),
+        initiator_url: entry.initiator_url.clone(),
+        status: entry.response_status,
+        status_text: entry.response_status_text.clone(),
+        mime_type: entry.mime_type.clone(),
+        protocol: entry.protocol.clone(),
+        remote_ip_address: entry.remote_ip_address.clone(),
+        remote_port: entry.remote_port,
+        from_disk_cache: entry.from_disk_cache,
+        from_service_worker: entry.from_service_worker,
+        encoded_data_length: entry.encoded_data_length,
+        failed: entry.failed,
+        canceled: entry.canceled,
+        error_text: entry.error_text.clone(),
+        finished: entry.finished,
+    }
+}
+
+fn upsert_request_event(
+    order: &mut Vec<String>,
+    requests: &mut HashMap<String, CapturedNetworkRequest>,
+    event: cdpkit::network::events::RequestWillBeSent,
+) {
+    let request_id = event.request_id.clone();
+    if !requests.contains_key(&request_id) {
+        order.push(request_id.clone());
+    }
+
+    let entry = requests
+        .entry(request_id.clone())
+        .or_insert_with(|| CapturedNetworkRequest {
+            request_id: request_id.clone(),
+            document_url: String::new(),
+            url: String::new(),
+            method: String::new(),
+            resource_type: None,
+            initiator_type: String::new(),
+            initiator_url: None,
+            request_headers: serde_json::json!({}),
+            has_post_data: false,
+            post_data: None,
+            response_status: None,
+            response_status_text: None,
+            response_headers: None,
+            mime_type: None,
+            protocol: None,
+            remote_ip_address: None,
+            remote_port: None,
+            from_disk_cache: false,
+            from_service_worker: false,
+            encoded_data_length: None,
+            failed: false,
+            canceled: false,
+            error_text: None,
+            finished: false,
+        });
+
+    entry.document_url = event.document_url;
+    entry.url = event.request.url;
+    entry.method = event.request.method;
+    entry.resource_type = event.type_.map(|value| value.as_ref().to_string());
+    entry.initiator_type = event.initiator.type_;
+    entry.initiator_url = event.initiator.url;
+    entry.request_headers = event.request.headers;
+    entry.has_post_data = event.request.has_post_data.unwrap_or(
+        event
+            .request
+            .post_data_entries
+            .as_ref()
+            .map(|entries| !entries.is_empty())
+            .unwrap_or(false),
+    );
+    entry.post_data = None;
+
+    if event.redirect_response.is_some() {
+        entry.response_status = None;
+        entry.response_status_text = None;
+        entry.response_headers = None;
+        entry.mime_type = None;
+        entry.protocol = None;
+        entry.remote_ip_address = None;
+        entry.remote_port = None;
+        entry.from_disk_cache = false;
+        entry.from_service_worker = false;
+        entry.encoded_data_length = None;
+        entry.failed = false;
+        entry.canceled = false;
+        entry.error_text = None;
+        entry.finished = false;
+    }
+}
+
+fn apply_response_event(
+    requests: &mut HashMap<String, CapturedNetworkRequest>,
+    event: cdpkit::network::events::ResponseReceived,
+) {
+    if let Some(entry) = requests.get_mut(&event.request_id) {
+        entry.resource_type = Some(event.type_.as_ref().to_string());
+        entry.response_status = Some(event.response.status);
+        entry.response_status_text = Some(event.response.status_text);
+        entry.response_headers = Some(event.response.headers);
+        entry.mime_type = Some(event.response.mime_type);
+        entry.protocol = event.response.protocol;
+        entry.remote_ip_address = event.response.remote_ip_address;
+        entry.remote_port = event.response.remote_port;
+        entry.from_disk_cache = event.response.from_disk_cache.unwrap_or(false);
+        entry.from_service_worker = event.response.from_service_worker.unwrap_or(false);
+        entry.encoded_data_length = Some(event.response.encoded_data_length);
+    }
+}
+
+fn apply_loading_finished(
+    requests: &mut HashMap<String, CapturedNetworkRequest>,
+    event: cdpkit::network::events::LoadingFinished,
+) {
+    if let Some(entry) = requests.get_mut(&event.request_id) {
+        entry.encoded_data_length = Some(event.encoded_data_length);
+        entry.finished = true;
+    }
+}
+
+fn apply_loading_failed(
+    requests: &mut HashMap<String, CapturedNetworkRequest>,
+    event: cdpkit::network::events::LoadingFailed,
+) {
+    if let Some(entry) = requests.get_mut(&event.request_id) {
+        entry.resource_type = Some(event.type_.as_ref().to_string());
+        entry.failed = true;
+        entry.canceled = event.canceled.unwrap_or(false);
+        entry.error_text = Some(event.error_text);
+        entry.finished = true;
+    }
+}
+
+async fn capture_network_requests(
+    cli: &Cli,
+    url: Option<&str>,
+    capture_timeout_ms: u64,
+    idle_ms: u64,
+    tab_selector: &str,
+) -> Result<(String, Vec<CapturedNetworkRequest>, CDP, String)> {
+    let (cdp, session) = connect_to_tab(cli, tab_selector).await?;
+
+    cdpkit::page::methods::Enable::new()
+        .send(&cdp, Some(&session))
+        .await?;
+    cdpkit::network::methods::Enable::new()
+        .with_max_total_buffer_size(100_000_000_i64)
+        .with_max_resource_buffer_size(10_000_000_i64)
+        .with_max_post_data_size(1_000_000_i64)
+        .with_enable_durable_messages(true)
+        .send(&cdp, Some(&session))
+        .await?;
+
+    let mut request_events = cdpkit::network::events::RequestWillBeSent::subscribe(&cdp);
+    let mut response_events = cdpkit::network::events::ResponseReceived::subscribe(&cdp);
+    let mut finished_events = cdpkit::network::events::LoadingFinished::subscribe(&cdp);
+    let mut failed_events = cdpkit::network::events::LoadingFailed::subscribe(&cdp);
+    let mut load_events = cdpkit::page::events::LoadEventFired::subscribe(&cdp);
+
+    let trigger = if let Some(url) = url {
+        cdpkit::page::methods::Navigate::new(url)
+            .send(&cdp, Some(&session))
+            .await?;
+        format!("navigate:{url}")
+    } else {
+        cdpkit::page::methods::Reload::new()
+            .send(&cdp, Some(&session))
+            .await?;
+        "reload".to_string()
+    };
+
+    let start = std::time::Instant::now();
+    let idle_window = std::time::Duration::from_millis(idle_ms);
+    let capture_timeout = std::time::Duration::from_millis(capture_timeout_ms);
+    let mut saw_load = false;
+    let mut last_activity = std::time::Instant::now();
+    let mut order = Vec::new();
+    let mut requests = HashMap::new();
+
+    loop {
+        if saw_load && last_activity.elapsed() >= idle_window {
+            break;
+        }
+
+        if start.elapsed() >= capture_timeout {
+            if !saw_load {
+                bail!(
+                    "Timed out waiting for page load after {}ms",
+                    capture_timeout_ms
+                );
+            }
+            break;
+        }
+
+        tokio::select! {
+            Some(event) = request_events.next() => {
+                upsert_request_event(&mut order, &mut requests, event);
+                last_activity = std::time::Instant::now();
+            }
+            Some(event) = response_events.next() => {
+                apply_response_event(&mut requests, event);
+                last_activity = std::time::Instant::now();
+            }
+            Some(event) = finished_events.next() => {
+                apply_loading_finished(&mut requests, event);
+                last_activity = std::time::Instant::now();
+            }
+            Some(event) = failed_events.next() => {
+                apply_loading_failed(&mut requests, event);
+                last_activity = std::time::Instant::now();
+            }
+            Some(_) = load_events.next() => {
+                saw_load = true;
+                last_activity = std::time::Instant::now();
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+        }
+    }
+
+    let captured = order
+        .into_iter()
+        .filter_map(|request_id| requests.remove(&request_id))
+        .collect::<Vec<_>>();
+
+    Ok((trigger, captured, cdp, session))
+}
+
+fn select_network_request<'a>(
+    requests: &'a [CapturedNetworkRequest],
+    matcher: &str,
+) -> Result<(&'a CapturedNetworkRequest, NetworkMatchKind, usize)> {
+    if let Some(exact) = requests.iter().find(|entry| entry.request_id == matcher) {
+        return Ok((exact, NetworkMatchKind::RequestId, 1));
+    }
+
+    let matches = requests
+        .iter()
+        .filter(|entry| entry.url.contains(matcher))
+        .collect::<Vec<_>>();
+
+    let Some(entry) = matches.last().copied() else {
+        bail!(
+            "No captured request matched '{}'. Use 'chromium-bridge network list' to inspect request ids.",
+            matcher
+        );
+    };
+
+    Ok((entry, NetworkMatchKind::UrlPattern, matches.len()))
+}
+
+fn is_text_like_mime(mime_type: Option<&str>) -> bool {
+    let Some(mime_type) = mime_type else {
+        return false;
+    };
+    mime_type.starts_with("text/")
+        || mime_type.contains("json")
+        || mime_type.contains("xml")
+        || mime_type.contains("javascript")
+        || mime_type.contains("svg")
+        || mime_type.contains("x-www-form-urlencoded")
+}
+
+fn truncate_text(text: &str, limit: usize) -> (String, bool) {
+    if limit == 0 {
+        return (text.to_string(), false);
+    }
+
+    let mut truncated = String::new();
+    for (count, ch) in text.chars().enumerate() {
+        if count == limit {
+            return (truncated, true);
+        }
+        truncated.push(ch);
+    }
+    (truncated, false)
+}
+
+fn decode_network_body(
+    body: &str,
+    base64_encoded: bool,
+    mime_type: Option<&str>,
+    limit: usize,
+) -> NetworkBodyOutput {
+    if !base64_encoded {
+        let (content, truncated) = truncate_text(body, limit);
+        return NetworkBodyOutput {
+            content,
+            encoding: "plain".to_string(),
+            was_base64_encoded: false,
+            truncated,
+            original_length: body.chars().count(),
+            decoded_byte_length: Some(body.len()),
+        };
+    }
+
+    let decoded = base64::engine::general_purpose::STANDARD.decode(body);
+    match decoded {
+        Ok(bytes) if is_text_like_mime(mime_type) => match String::from_utf8(bytes.clone()) {
+            Ok(text) => {
+                let (content, truncated) = truncate_text(&text, limit);
+                NetworkBodyOutput {
+                    content,
+                    encoding: "utf8".to_string(),
+                    was_base64_encoded: true,
+                    truncated,
+                    original_length: text.chars().count(),
+                    decoded_byte_length: Some(bytes.len()),
+                }
+            }
+            Err(_) => {
+                let (content, truncated) = truncate_text(body, limit);
+                NetworkBodyOutput {
+                    content,
+                    encoding: "base64".to_string(),
+                    was_base64_encoded: true,
+                    truncated,
+                    original_length: body.chars().count(),
+                    decoded_byte_length: None,
+                }
+            }
+        },
+        Ok(bytes) => {
+            let (content, truncated) = truncate_text(body, limit);
+            NetworkBodyOutput {
+                content,
+                encoding: "base64".to_string(),
+                was_base64_encoded: true,
+                truncated,
+                original_length: body.chars().count(),
+                decoded_byte_length: Some(bytes.len()),
+            }
+        }
+        Err(_) => {
+            let (content, truncated) = truncate_text(body, limit);
+            NetworkBodyOutput {
+                content,
+                encoding: "base64".to_string(),
+                was_base64_encoded: true,
+                truncated,
+                original_length: body.chars().count(),
+                decoded_byte_length: None,
+            }
+        }
+    }
+}
+
+fn format_size(bytes: Option<f64>) -> String {
+    let Some(bytes) = bytes else {
+        return "?".to_string();
+    };
+    if bytes >= 1_000_000.0 {
+        format!("{:.1} MB", bytes / 1_000_000.0)
+    } else if bytes >= 1_000.0 {
+        format!("{:.1} KB", bytes / 1_000.0)
+    } else {
+        format!("{bytes:.0} B")
+    }
+}
+
+fn print_json_block(label: &str, value: &serde_json::Value) -> Result<()> {
+    println!("{label}:");
+    println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
 }
 
 async fn navigate_and_wait(cdp: &CDP, session: &str, url: &str) -> Result<()> {
@@ -1040,6 +1556,225 @@ async fn cmd_snapshot(cli: &Cli, depth: Option<i64>, tab_selector: &str) -> Resu
     Ok(())
 }
 
+async fn cmd_network_list(
+    cli: &Cli,
+    url: Option<&str>,
+    capture_timeout_ms: u64,
+    idle_ms: u64,
+    limit: Option<usize>,
+    tab_selector: &str,
+) -> Result<()> {
+    let (trigger, captured, _cdp, _session) =
+        capture_network_requests(cli, url, capture_timeout_ms, idle_ms, tab_selector).await?;
+    let requests = captured
+        .iter()
+        .map(network_summary)
+        .collect::<Vec<NetworkRequestSummary>>();
+
+    let output = NetworkListOutput {
+        trigger,
+        request_count: requests.len(),
+        requests,
+    };
+
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!(
+            "Captured {} request{} via {}",
+            output.request_count,
+            if output.request_count == 1 { "" } else { "s" },
+            output.trigger
+        );
+        for request in output.requests.iter().take(limit.unwrap_or(usize::MAX)) {
+            let status = if request.failed {
+                "failed".to_string()
+            } else if let Some(status) = request.status {
+                status.to_string()
+            } else if request.finished {
+                "done".to_string()
+            } else {
+                "pending".to_string()
+            };
+            let resource_type = request.resource_type.as_deref().unwrap_or("unknown");
+            let mime = request.mime_type.as_deref().unwrap_or("?");
+            println!(
+                "[{status} {resource_type}] {} {}",
+                request.method, request.url
+            );
+            println!(
+                "  id={} size={} mime={}",
+                request.request_id,
+                format_size(request.encoded_data_length),
+                mime
+            );
+        }
+    }
+
+    Ok(())
+}
+
+async fn cmd_network_inspect(
+    cli: &Cli,
+    matcher: &str,
+    url: Option<&str>,
+    capture_timeout_ms: u64,
+    idle_ms: u64,
+    body_limit: usize,
+    tab_selector: &str,
+) -> Result<()> {
+    let (trigger, captured, cdp, session) =
+        capture_network_requests(cli, url, capture_timeout_ms, idle_ms, tab_selector).await?;
+    let (matched, matched_by, matched_count) = select_network_request(&captured, matcher)?;
+
+    let request_post_data = if let Some(post_data) = matched.post_data.clone() {
+        Some(post_data)
+    } else if matched.has_post_data {
+        match cdpkit::network::methods::GetRequestPostData::new(matched.request_id.clone())
+            .send(&cdp, Some(&session))
+            .await
+        {
+            Ok(result) => Some(result.post_data),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
+    let request_post_data_error = if matched.has_post_data && request_post_data.is_none() {
+        Some("CDP did not retain request post data for this request".to_string())
+    } else {
+        None
+    };
+
+    let (response_body, response_body_error) = if matched.response_status.is_some() {
+        match cdpkit::network::methods::GetResponseBody::new(matched.request_id.clone())
+            .send(&cdp, Some(&session))
+            .await
+        {
+            Ok(result) => (
+                Some(decode_network_body(
+                    &result.body,
+                    result.base64_encoded,
+                    matched.mime_type.as_deref(),
+                    body_limit,
+                )),
+                None,
+            ),
+            Err(err) => (None, Some(err.to_string())),
+        }
+    } else {
+        (
+            None,
+            Some("No HTTP response was captured for this request".to_string()),
+        )
+    };
+
+    let output = NetworkInspectOutput {
+        trigger,
+        matcher: matcher.to_string(),
+        matched_by: match matched_by {
+            NetworkMatchKind::RequestId => "requestId".to_string(),
+            NetworkMatchKind::UrlPattern => "urlPattern".to_string(),
+        },
+        matched_count,
+        request: network_summary(matched),
+        request_headers: matched.request_headers.clone(),
+        response_headers: matched.response_headers.clone(),
+        request_post_data,
+        request_post_data_error,
+        response_body,
+        response_body_error,
+    };
+
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!("Trigger: {}", output.trigger);
+        println!(
+            "Matched by {} ({} match{})",
+            output.matched_by,
+            output.matched_count,
+            if output.matched_count == 1 { "" } else { "es" }
+        );
+        println!("Request id: {}", output.request.request_id);
+        println!(
+            "Type: {}",
+            output.request.resource_type.as_deref().unwrap_or("unknown")
+        );
+        println!("Method: {}", output.request.method);
+        println!("URL: {}", output.request.url);
+        println!(
+            "Status: {}",
+            output
+                .request
+                .status
+                .map(|status| {
+                    if let Some(text) = output.request.status_text.as_deref() {
+                        format!("{status} {text}")
+                    } else {
+                        status.to_string()
+                    }
+                })
+                .unwrap_or_else(|| "n/a".to_string())
+        );
+        println!(
+            "Mime: {}",
+            output.request.mime_type.as_deref().unwrap_or("unknown")
+        );
+        println!(
+            "Protocol: {}",
+            output.request.protocol.as_deref().unwrap_or("unknown")
+        );
+        if let Some(remote_ip) = output.request.remote_ip_address.as_deref() {
+            if let Some(remote_port) = output.request.remote_port {
+                println!("Remote: {remote_ip}:{remote_port}");
+            } else {
+                println!("Remote: {remote_ip}");
+            }
+        }
+        println!(
+            "Cache: disk={} service_worker={}",
+            output.request.from_disk_cache, output.request.from_service_worker
+        );
+        println!(
+            "Encoded size: {}",
+            format_size(output.request.encoded_data_length)
+        );
+        if output.request.failed {
+            println!(
+                "Failure: {}",
+                output
+                    .request
+                    .error_text
+                    .as_deref()
+                    .unwrap_or("unknown error")
+            );
+        }
+        print_json_block("Request headers", &output.request_headers)?;
+        if let Some(response_headers) = output.response_headers.as_ref() {
+            print_json_block("Response headers", response_headers)?;
+        }
+        if let Some(post_data) = output.request_post_data.as_deref() {
+            println!("Request body:");
+            println!("{post_data}");
+        } else if let Some(err) = output.request_post_data_error.as_deref() {
+            println!("Request body: {err}");
+        }
+        if let Some(body) = output.response_body.as_ref() {
+            println!(
+                "Response body (encoding={}, truncated={}):",
+                body.encoding, body.truncated
+            );
+            println!("{}", body.content);
+        } else if let Some(err) = output.response_body_error.as_deref() {
+            println!("Response body: {err}");
+        }
+    }
+
+    Ok(())
+}
+
 async fn cmd_state_save(
     cli: &Cli,
     name: &str,
@@ -1393,6 +2128,80 @@ mod tests {
                 .contains("Snapshot names cannot contain path separators")
         );
     }
+
+    #[test]
+    fn network_request_match_prefers_exact_request_id() {
+        let requests = vec![
+            CapturedNetworkRequest {
+                request_id: "1234.1".to_string(),
+                document_url: "https://example.com".to_string(),
+                url: "https://example.com/api/search".to_string(),
+                method: "GET".to_string(),
+                resource_type: Some("XHR".to_string()),
+                initiator_type: "script".to_string(),
+                initiator_url: None,
+                request_headers: serde_json::json!({}),
+                has_post_data: false,
+                post_data: None,
+                response_status: Some(200),
+                response_status_text: Some("OK".to_string()),
+                response_headers: Some(serde_json::json!({})),
+                mime_type: Some("application/json".to_string()),
+                protocol: Some("h2".to_string()),
+                remote_ip_address: None,
+                remote_port: None,
+                from_disk_cache: false,
+                from_service_worker: false,
+                encoded_data_length: Some(42.0),
+                failed: false,
+                canceled: false,
+                error_text: None,
+                finished: true,
+            },
+            CapturedNetworkRequest {
+                request_id: "5678.9".to_string(),
+                document_url: "https://example.com".to_string(),
+                url: "https://example.com/api/other".to_string(),
+                method: "GET".to_string(),
+                resource_type: Some("XHR".to_string()),
+                initiator_type: "script".to_string(),
+                initiator_url: None,
+                request_headers: serde_json::json!({}),
+                has_post_data: false,
+                post_data: None,
+                response_status: Some(200),
+                response_status_text: Some("OK".to_string()),
+                response_headers: Some(serde_json::json!({})),
+                mime_type: Some("application/json".to_string()),
+                protocol: Some("h2".to_string()),
+                remote_ip_address: None,
+                remote_port: None,
+                from_disk_cache: false,
+                from_service_worker: false,
+                encoded_data_length: Some(42.0),
+                failed: false,
+                canceled: false,
+                error_text: None,
+                finished: true,
+            },
+        ];
+
+        let (matched, matched_by, matched_count) =
+            select_network_request(&requests, "1234.1").expect("matched request");
+        assert_eq!(matched.request_id, "1234.1");
+        assert!(matches!(matched_by, NetworkMatchKind::RequestId));
+        assert_eq!(matched_count, 1);
+    }
+
+    #[test]
+    fn decode_network_body_decodes_utf8_from_base64() {
+        let encoded = base64::engine::general_purpose::STANDARD.encode("{\"ok\":true}");
+        let body = decode_network_body(&encoded, true, Some("application/json"), 4000);
+        assert_eq!(body.content, "{\"ok\":true}");
+        assert_eq!(body.encoding, "utf8");
+        assert!(body.was_base64_encoded);
+        assert!(!body.truncated);
+    }
 }
 
 #[tokio::main]
@@ -1420,6 +2229,44 @@ async fn main() -> Result<()> {
             tab,
         } => cmd_wait(&cli, selector, *wait_timeout, tab).await,
         Command::Snapshot { depth, tab } => cmd_snapshot(&cli, *depth, tab).await,
+        Command::Network { action } => match action {
+            NetworkAction::List {
+                url,
+                capture_timeout,
+                idle_ms,
+                limit,
+                tab,
+            } => {
+                cmd_network_list(
+                    &cli,
+                    url.as_deref(),
+                    *capture_timeout,
+                    *idle_ms,
+                    *limit,
+                    tab,
+                )
+                .await
+            }
+            NetworkAction::Inspect {
+                matcher,
+                url,
+                capture_timeout,
+                idle_ms,
+                body_limit,
+                tab,
+            } => {
+                cmd_network_inspect(
+                    &cli,
+                    matcher,
+                    url.as_deref(),
+                    *capture_timeout,
+                    *idle_ms,
+                    *body_limit,
+                    tab,
+                )
+                .await
+            }
+        },
         Command::State { action } => match action {
             StateAction::Save { name, path, tab } => {
                 cmd_state_save(&cli, name, path.as_deref(), tab).await
