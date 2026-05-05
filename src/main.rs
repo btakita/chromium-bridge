@@ -5,13 +5,15 @@
 //! - `Cli` struct holds global options (`--host`, `--port`, `--timeout`, `--json`)
 //!   and a `Command` subcommand enum.
 //! - Commands: `Check`, `List`, `Navigate`, `Evaluate`, `Screenshot`, `Markdown`, `Setup`,
-//!   `Click`, `Type`, `SelectTab`, `Wait`, `Snapshot`, `Network`, `State`, `Skill`.
+//!   `Click`, `Type`, `SelectTab`, `Wait`, `Snapshot`, `Network`, `Ingest`, `State`, `Skill`.
 //! - CDP communication: HTTP (`/json/*`) for tab listing/version, WebSocket via `cdpkit`
 //!   for page-level commands (navigate, evaluate, screenshot, input).
 //! - `connect_to_tab` creates a cdpkit `CDP` client and attaches to a specific tab by index.
 //! - Screenshot and markdown commands use `LoadEventFired` event streaming for page load
 //!   detection instead of fixed delays.
 //! - `cmd_markdown` injects a DOM walker JS that converts page content to clean markdown.
+//! - `cmd_ingest` writes extracted page markdown into a corky conversations corpus and can
+//!   optionally trigger `corky sync routes` / `corky ragie push`.
 //! - `state save/load/list` persists cookies plus local/session storage for repeatable
 //!   authenticated workflows and lightweight profile-like reuse.
 //! - `cmd_setup` detects installed Chromium browsers and checks debugging flag status.
@@ -49,6 +51,7 @@
 //! - snapshot_raw_ax: `chromium-bridge snapshot --json --raw` → emits raw AXNode protocol objects
 //! - network_list_reload: `chromium-bridge network list --tab linkedin` → reloads tab and lists requests
 //! - network_inspect_match: `chromium-bridge network inspect graphql --tab linkedin` → reloads tab and prints matched request details
+//! - ingest_writes_corky_doc: `chromium-bridge ingest https://example.com` → writes a corky-style markdown doc into `mail/conversations/`
 //! - state_save_named: `chromium-bridge state save linkedin-auth --tab linkedin` → writes JSON snapshot
 //! - state_load_named: `chromium-bridge state load linkedin-auth --tab linkedin` → restores cookies + storage
 //! - state_list: `chromium-bridge state list` → enumerates named snapshots
@@ -58,10 +61,12 @@
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use cdpkit::CDP;
+use chrono::Utc;
 use clap::{Parser, Subcommand};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::Path;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -181,6 +186,38 @@ enum Command {
     Network {
         #[command(subcommand)]
         action: NetworkAction,
+    },
+    /// Extract a page into a corky conversations corpus
+    Ingest {
+        /// URL to ingest
+        url: String,
+        /// Optional subject/title override
+        #[arg(long)]
+        title: Option<String>,
+        /// Optional filename slug override (without .md)
+        #[arg(long)]
+        slug: Option<String>,
+        /// Comma-separated labels to write into the corky document
+        #[arg(long, default_value = "web")]
+        labels: String,
+        /// Comma-separated account names to write into the corky document
+        #[arg(long, default_value = "chromium-bridge")]
+        accounts: String,
+        /// Optional explicit corky data dir (defaults to corky's normal resolution order)
+        #[arg(long)]
+        corky_data: Option<String>,
+        /// Run `corky sync routes` after writing the document
+        #[arg(long)]
+        route: bool,
+        /// Run `corky ragie push` after writing the document
+        #[arg(long)]
+        ragie_push: bool,
+        /// Use `corky ragie push --full` instead of the default fast mode
+        #[arg(long)]
+        ragie_full: bool,
+        /// Target tab: index number or URL substring pattern (default: 0)
+        #[arg(long, default_value = "0")]
+        tab: String,
     },
     /// Save or restore persistent browser state snapshots
     State {
@@ -477,6 +514,52 @@ struct SnapshotValueOutput {
     related_text: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtractedPage {
+    url: String,
+    title: String,
+    markdown: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IngestOutput {
+    path: String,
+    corky_data_dir: String,
+    slug: String,
+    subject: String,
+    thread_id: String,
+    source_url: String,
+    routed: bool,
+    ragie_pushed: bool,
+}
+
+struct IngestDocument<'a> {
+    subject: &'a str,
+    labels: &'a [String],
+    accounts: &'a [String],
+    thread_id: &'a str,
+    source_url: &'a str,
+    source_title: &'a str,
+    sender: &'a str,
+    timestamp: &'a str,
+    markdown: &'a str,
+}
+
+struct IngestRequest<'a> {
+    url: &'a str,
+    title_override: Option<&'a str>,
+    slug_override: Option<&'a str>,
+    labels_raw: &'a str,
+    accounts_raw: &'a str,
+    corky_data_override: Option<&'a str>,
+    route: bool,
+    ragie_push: bool,
+    ragie_full: bool,
+    tab_selector: &'a str,
+}
+
 fn base_url(cli: &Cli) -> String {
     format!("http://{}:{}", cli.host, cli.port)
 }
@@ -512,6 +595,38 @@ fn expand_path_with_home(path: &str, home: Option<&str>) -> Result<PathBuf> {
 fn expand_path(path: &str) -> Result<PathBuf> {
     let home = std::env::var("HOME").ok();
     expand_path_with_home(path, home.as_deref())
+}
+
+fn resolve_corky_data_dir_from(
+    explicit_dir: Option<&str>,
+    cwd: &Path,
+    env_dir: Option<&str>,
+    home: Option<&str>,
+) -> Result<PathBuf> {
+    if let Some(path) = explicit_dir {
+        return expand_path_with_home(path, home);
+    }
+    if cwd.join(".corky.toml").exists() || cwd.join("corky.toml").exists() {
+        return Ok(cwd.to_path_buf());
+    }
+    let local_mail = cwd.join("mail");
+    if local_mail.is_dir() {
+        return Ok(local_mail);
+    }
+    if let Some(path) = env_dir
+        && !path.is_empty()
+    {
+        return expand_path_with_home(path, home);
+    }
+    let home = home.context("HOME is not set")?;
+    Ok(PathBuf::from(home).join("Documents").join("mail"))
+}
+
+fn resolve_corky_data_dir(explicit_dir: Option<&str>) -> Result<PathBuf> {
+    let cwd = std::env::current_dir().context("Failed to read current directory")?;
+    let env_dir = std::env::var("CORKY_DATA").ok();
+    let home = std::env::var("HOME").ok();
+    resolve_corky_data_dir_from(explicit_dir, &cwd, env_dir.as_deref(), home.as_deref())
 }
 
 fn state_root_from_env(
@@ -553,6 +668,112 @@ fn validate_state_name(name: &str) -> Result<()> {
     }
     if name.contains('/') || name.contains('\\') {
         bail!("Snapshot names cannot contain path separators; use --path for explicit file paths");
+    }
+    Ok(())
+}
+
+fn normalize_csv_values(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn slugify_token(raw: &str) -> String {
+    let mut slug = String::new();
+    let mut previous_dash = false;
+    for ch in raw.chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch);
+            previous_dash = false;
+        } else if !previous_dash && !slug.is_empty() {
+            slug.push('-');
+            previous_dash = true;
+        }
+    }
+    slug.trim_matches('-').to_string()
+}
+
+fn default_ingest_slug(url: &str, title: &str) -> String {
+    if let Ok(parsed) = reqwest::Url::parse(url) {
+        let mut parts = Vec::new();
+        if let Some(host) = parsed.host_str() {
+            let host_slug = slugify_token(host);
+            if !host_slug.is_empty() {
+                parts.push(host_slug);
+            }
+        }
+        for segment in parsed
+            .path_segments()
+            .into_iter()
+            .flatten()
+            .filter(|segment| !segment.is_empty())
+            .take(6)
+        {
+            let segment_slug = slugify_token(segment);
+            if !segment_slug.is_empty() {
+                parts.push(segment_slug);
+            }
+        }
+        if !parts.is_empty() {
+            return parts.join("-");
+        }
+    }
+
+    let title_slug = slugify_token(title);
+    if !title_slug.is_empty() {
+        title_slug
+    } else {
+        "web-page".to_string()
+    }
+}
+
+fn resolve_ingest_slug(explicit_slug: Option<&str>, url: &str, title: &str) -> Result<String> {
+    let slug = explicit_slug
+        .map(slugify_token)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default_ingest_slug(url, title));
+    if slug.is_empty() {
+        bail!("Unable to derive a filename slug; pass --slug explicitly");
+    }
+    Ok(slug)
+}
+
+fn render_ingest_document(document: &IngestDocument<'_>) -> String {
+    let labels_line = document.labels.join(", ");
+    let accounts_line = document.accounts.join(", ");
+    format!(
+        "# {subject}\n\n**Labels**: {labels_line}\n**Accounts**: {accounts_line}\n**Thread ID**: {thread_id}\n**Last updated**: {timestamp}\n**Source URL**: {source_url}\n**Source Title**: {source_title}\n\n---\n\n## {sender} — {timestamp}\n\n{body}\n",
+        subject = document.subject,
+        thread_id = document.thread_id,
+        timestamp = document.timestamp,
+        source_url = document.source_url,
+        source_title = document.source_title,
+        sender = document.sender,
+        body = document.markdown.trim()
+    )
+}
+
+fn infer_ingest_sender(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(ToString::to_string))
+        .unwrap_or_else(|| "web".to_string())
+}
+
+fn run_corky_command(data_dir: &Path, args: &[&str]) -> Result<()> {
+    let output = std::process::Command::new("corky")
+        .args(args)
+        .env("CORKY_DATA", data_dir)
+        .output()
+        .with_context(|| format!("Failed to run 'corky {}'", args.join(" ")))?;
+    if !output.status.success() {
+        bail!(
+            "corky {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
     Ok(())
 }
@@ -1201,6 +1422,84 @@ async fn navigate_and_wait(cdp: &CDP, session: &str, url: &str) -> Result<()> {
     Ok(())
 }
 
+async fn extract_page_markdown(cdp: &CDP, session: &str) -> Result<ExtractedPage> {
+    let js = r#"
+    (() => {
+        const clone = document.cloneNode(true);
+        clone.querySelectorAll('script, style, nav, footer, aside, iframe, noscript').forEach(el => el.remove());
+
+        function nodeToMarkdown(node) {
+            if (node.nodeType === Node.TEXT_NODE) {
+                return node.textContent.replace(/\s+/g, ' ');
+            }
+            if (node.nodeType !== Node.ELEMENT_NODE) return '';
+
+            const tag = node.tagName.toLowerCase();
+            const children = Array.from(node.childNodes).map(c => nodeToMarkdown(c)).join('');
+
+            switch(tag) {
+                case 'h1': return '\n# ' + children.trim() + '\n';
+                case 'h2': return '\n## ' + children.trim() + '\n';
+                case 'h3': return '\n### ' + children.trim() + '\n';
+                case 'h4': return '\n#### ' + children.trim() + '\n';
+                case 'h5': return '\n##### ' + children.trim() + '\n';
+                case 'h6': return '\n###### ' + children.trim() + '\n';
+                case 'p': return '\n' + children.trim() + '\n';
+                case 'br': return '\n';
+                case 'strong': case 'b': return '**' + children.trim() + '**';
+                case 'em': case 'i': return '*' + children.trim() + '*';
+                case 'code': return '`' + children.trim() + '`';
+                case 'pre': return '\n```\n' + children.trim() + '\n```\n';
+                case 'a': {
+                    const href = node.getAttribute('href') || '';
+                    return '[' + children.trim() + '](' + href + ')';
+                }
+                case 'img': {
+                    const alt = node.getAttribute('alt') || '';
+                    const src = node.getAttribute('src') || '';
+                    return '![' + alt + '](' + src + ')';
+                }
+                case 'li': return '- ' + children.trim() + '\n';
+                case 'ul': case 'ol': return '\n' + children;
+                case 'blockquote': return '\n> ' + children.trim().replace(/\n/g, '\n> ') + '\n';
+                case 'hr': return '\n---\n';
+                case 'table': return '\n' + children + '\n';
+                case 'tr': return children + '|\n';
+                case 'th': return '| **' + children.trim() + '** ';
+                case 'td': return '| ' + children.trim() + ' ';
+                default: return children;
+            }
+        }
+
+        const article = clone.querySelector('article, main, [role="main"]') || clone.querySelector('body') || clone.documentElement;
+        let markdown = nodeToMarkdown(article);
+        markdown = markdown.replace(/\n{3,}/g, '\n\n').trim();
+
+        return {
+            url: window.location.href,
+            title: document.title || window.location.href,
+            markdown,
+        };
+    })()
+    "#;
+
+    let result = cdpkit::runtime::methods::Evaluate::new(js)
+        .with_return_by_value(true)
+        .send(cdp, Some(session))
+        .await?;
+
+    let value = result
+        .result
+        .value
+        .context("Failed to extract page markdown payload")?;
+    let page: ExtractedPage =
+        serde_json::from_value(value).context("Failed to parse extracted page payload")?;
+    if page.markdown.trim().is_empty() {
+        bail!("Failed to extract markdown from page");
+    }
+    Ok(page)
+}
+
 async fn reload_and_wait(cdp: &CDP, session: &str) -> Result<()> {
     cdpkit::page::methods::Enable::new()
         .send(cdp, Some(session))
@@ -1477,71 +1776,89 @@ async fn cmd_screenshot(
 async fn cmd_markdown(cli: &Cli, url: &str, tab_selector: &str) -> Result<()> {
     let (cdp, session) = connect_to_tab(cli, tab_selector).await?;
     navigate_and_wait(&cdp, &session, url).await?;
+    let page = extract_page_markdown(&cdp, &session).await?;
+    println!("{}", page.markdown);
+    Ok(())
+}
 
-    let js = r#"
-    (function() {
-        const clone = document.cloneNode(true);
-        clone.querySelectorAll('script, style, nav, footer, aside, iframe, noscript').forEach(el => el.remove());
+async fn cmd_ingest(cli: &Cli, request: &IngestRequest<'_>) -> Result<()> {
+    let (cdp, session) = connect_to_tab(cli, request.tab_selector).await?;
+    navigate_and_wait(&cdp, &session, request.url).await?;
+    let page = extract_page_markdown(&cdp, &session).await?;
 
-        function nodeToMarkdown(node) {
-            if (node.nodeType === Node.TEXT_NODE) {
-                return node.textContent.replace(/\s+/g, ' ');
-            }
-            if (node.nodeType !== Node.ELEMENT_NODE) return '';
+    let subject = request
+        .title_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(page.title.as_str())
+        .to_string();
+    let slug = resolve_ingest_slug(request.slug_override, &page.url, &subject)?;
+    let labels = normalize_csv_values(request.labels_raw);
+    let accounts = normalize_csv_values(request.accounts_raw);
+    let thread_id = format!("web:{}", page.url);
+    let timestamp = Utc::now().to_rfc2822();
+    let sender = infer_ingest_sender(&page.url);
+    let document = render_ingest_document(&IngestDocument {
+        subject: &subject,
+        labels: &labels,
+        accounts: &accounts,
+        thread_id: &thread_id,
+        source_url: &page.url,
+        source_title: &page.title,
+        sender: &sender,
+        timestamp: &timestamp,
+        markdown: &page.markdown,
+    });
 
-            const tag = node.tagName.toLowerCase();
-            const children = Array.from(node.childNodes).map(c => nodeToMarkdown(c)).join('');
+    let corky_data_dir = resolve_corky_data_dir(request.corky_data_override)?;
+    let conversations_dir = corky_data_dir.join("conversations");
+    std::fs::create_dir_all(&conversations_dir).with_context(|| {
+        format!(
+            "Failed to create corky conversations dir {}",
+            conversations_dir.display()
+        )
+    })?;
+    let path = conversations_dir.join(format!("{slug}.md"));
+    std::fs::write(&path, document)
+        .with_context(|| format!("Failed to write {}", path.display()))?;
 
-            switch(tag) {
-                case 'h1': return '\n# ' + children.trim() + '\n';
-                case 'h2': return '\n## ' + children.trim() + '\n';
-                case 'h3': return '\n### ' + children.trim() + '\n';
-                case 'h4': return '\n#### ' + children.trim() + '\n';
-                case 'h5': return '\n##### ' + children.trim() + '\n';
-                case 'h6': return '\n###### ' + children.trim() + '\n';
-                case 'p': return '\n' + children.trim() + '\n';
-                case 'br': return '\n';
-                case 'strong': case 'b': return '**' + children.trim() + '**';
-                case 'em': case 'i': return '*' + children.trim() + '*';
-                case 'code': return '`' + children.trim() + '`';
-                case 'pre': return '\n```\n' + children.trim() + '\n```\n';
-                case 'a': {
-                    const href = node.getAttribute('href') || '';
-                    return '[' + children.trim() + '](' + href + ')';
-                }
-                case 'img': {
-                    const alt = node.getAttribute('alt') || '';
-                    const src = node.getAttribute('src') || '';
-                    return '![' + alt + '](' + src + ')';
-                }
-                case 'li': return '- ' + children.trim() + '\n';
-                case 'ul': case 'ol': return '\n' + children;
-                case 'blockquote': return '\n> ' + children.trim().replace(/\n/g, '\n> ') + '\n';
-                case 'hr': return '\n---\n';
-                case 'table': return '\n' + children + '\n';
-                case 'tr': return children + '|\n';
-                case 'th': return '| **' + children.trim() + '** ';
-                case 'td': return '| ' + children.trim() + ' ';
-                default: return children;
-            }
+    if request.route {
+        run_corky_command(&corky_data_dir, &["sync", "routes"])?;
+    }
+    if request.ragie_push {
+        if request.ragie_full {
+            run_corky_command(&corky_data_dir, &["ragie", "push", "--full"])?;
+        } else {
+            run_corky_command(&corky_data_dir, &["ragie", "push"])?;
         }
+    }
 
-        const article = clone.querySelector('article, main, [role="main"]') || clone.querySelector('body') || clone.documentElement;
-        let md = nodeToMarkdown(article);
-        md = md.replace(/\n{3,}/g, '\n\n').trim();
-        return md;
-    })()
-    "#;
+    let output = IngestOutput {
+        path: path.display().to_string(),
+        corky_data_dir: corky_data_dir.display().to_string(),
+        slug,
+        subject,
+        thread_id,
+        source_url: page.url,
+        routed: request.route,
+        ragie_pushed: request.ragie_push,
+    };
 
-    let result = cdpkit::runtime::methods::Evaluate::new(js)
-        .with_return_by_value(true)
-        .send(&cdp, Some(&session))
-        .await?;
-
-    if let Some(serde_json::Value::String(md)) = &result.result.value {
-        println!("{}", md);
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
-        bail!("Failed to extract markdown from page");
+        println!("Ingested {} into {}", output.source_url, output.path);
+        println!("Subject: {}", output.subject);
+        println!("Corky data dir: {}", output.corky_data_dir);
+        if output.routed {
+            println!("Post-step: ran `corky sync routes`");
+        }
+        if output.ragie_pushed {
+            println!(
+                "Post-step: ran `corky ragie push{}`",
+                if request.ragie_full { " --full" } else { "" }
+            );
+        }
     }
     Ok(())
 }
@@ -2450,6 +2767,50 @@ mod tests {
         assert!(!body.truncated);
     }
 
+    #[test]
+    fn corky_data_resolution_matches_corky_defaults() {
+        let cwd = PathBuf::from("/tmp/workspace");
+        let resolved =
+            resolve_corky_data_dir_from(None, &cwd, Some("/tmp/mail-root"), Some("/tmp/home"))
+                .expect("resolved dir");
+        assert_eq!(resolved, PathBuf::from("/tmp/mail-root"));
+
+        let fallback =
+            resolve_corky_data_dir_from(None, &cwd, None, Some("/tmp/home")).expect("fallback");
+        assert_eq!(fallback, PathBuf::from("/tmp/home/Documents/mail"));
+    }
+
+    #[test]
+    fn ingest_slug_defaults_to_host_and_path() {
+        let slug = resolve_ingest_slug(
+            None,
+            "https://docs.example.com/guides/intro/",
+            "Ignored Title",
+        )
+        .expect("slug");
+        assert_eq!(slug, "docs-example-com-guides-intro");
+    }
+
+    #[test]
+    fn ingest_document_uses_corky_thread_shape() {
+        let rendered = render_ingest_document(&IngestDocument {
+            subject: "Example Subject",
+            labels: &[String::from("web"), String::from("research")],
+            accounts: &[String::from("chromium-bridge")],
+            thread_id: "web:https://example.com/guide",
+            source_url: "https://example.com/guide",
+            source_title: "Example Page",
+            sender: "example.com",
+            timestamp: "Tue, 05 May 2026 12:00:00 +0000",
+            markdown: "# Heading\n\nBody text",
+        });
+        assert!(rendered.contains("**Labels**: web, research"));
+        assert!(rendered.contains("**Thread ID**: web:https://example.com/guide"));
+        assert!(rendered.contains("**Source URL**: https://example.com/guide"));
+        assert!(rendered.contains("## example.com — Tue, 05 May 2026 12:00:00 +0000"));
+        assert!(rendered.contains("# Heading\n\nBody text"));
+    }
+
     fn ax_string(value: &str) -> cdpkit::accessibility::types::AXValue {
         cdpkit::accessibility::types::AXValue {
             type_: cdpkit::accessibility::types::AXValueType::String,
@@ -2638,6 +2999,35 @@ async fn main() -> Result<()> {
                 .await
             }
         },
+        Command::Ingest {
+            url,
+            title,
+            slug,
+            labels,
+            accounts,
+            corky_data,
+            route,
+            ragie_push,
+            ragie_full,
+            tab,
+        } => {
+            cmd_ingest(
+                &cli,
+                &IngestRequest {
+                    url,
+                    title_override: title.as_deref(),
+                    slug_override: slug.as_deref(),
+                    labels_raw: labels,
+                    accounts_raw: accounts,
+                    corky_data_override: corky_data.as_deref(),
+                    route: *route,
+                    ragie_push: *ragie_push,
+                    ragie_full: *ragie_full,
+                    tab_selector: tab,
+                },
+            )
+            .await
+        }
         Command::State { action } => match action {
             StateAction::Save { name, path, tab } => {
                 cmd_state_save(&cli, name, path.as_deref(), tab).await

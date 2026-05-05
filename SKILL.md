@@ -19,6 +19,7 @@ CLI for browser automation via Chrome DevTools Protocol (CDP). Direct WebSocket 
 | `snapshot` | Dump the page accessibility tree |
 | `network list` | Reload or navigate and list captured network requests |
 | `network inspect '<matcher>'` | Reload or navigate and inspect one matched request |
+| `ingest <url>` | Write extracted page markdown into a corky conversations corpus |
 | `state save <name>` | Save cookies plus local/session storage |
 | `state load <name>` | Restore cookies plus local/session storage |
 | `state list` | List saved state snapshots |
@@ -99,6 +100,20 @@ chromium-bridge network inspect graphql --url https://www.linkedin.com/feed/ --t
 ```
 
 If `--url` is omitted, the command reloads the target tab. Use `--capture-timeout` and `--idle-ms` on heavy pages that keep loading after first paint.
+
+## Ingest
+
+Use `ingest` when the page should be searchable through corky/sift/ragie without manually redirecting `markdown` output into `mail/conversations/`.
+
+```bash
+# Write into the default corky mailbox root
+chromium-bridge ingest https://example.com/docs/intro
+
+# Fan out routed mailboxes and push the new file to Ragie
+chromium-bridge ingest https://example.com/docs/intro --labels web,research --route --ragie-push
+```
+
+The command writes a corky-style markdown conversation file into the resolved corky `conversations/` directory. Pass `--corky-data` to target a different mailbox root, `--slug` to control the filename, or `--title` to override the generated subject.
 
 ## State
 

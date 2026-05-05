@@ -65,6 +65,9 @@ Captures network traffic for a page load and prints a request summary. If `--url
 ### `network inspect <matcher>`
 Captures network traffic for a page load, selects a single request by exact request id or URL substring, and prints request/response details. Response bodies are fetched via `Network.getResponseBody`; request bodies use `Network.getRequestPostData` when available. Text-like responses are decoded to UTF-8, and binary payloads stay base64.
 
+### `ingest <url>`
+Navigates to a page, extracts markdown with the same DOM walker as `markdown`, and writes a corky-style conversation document into the resolved `mail/conversations/` corpus. By default the corky data dir follows corky's own resolution order (`.corky.toml` / `corky.toml` in cwd, `mail/` in cwd, `CORKY_DATA`, then `~/Documents/mail`). `--title` overrides the subject, `--slug` overrides the filename, `--labels` / `--accounts` populate corky metadata, `--route` runs `corky sync routes`, and `--ragie-push [--ragie-full]` shells out to corky's Ragie backend after the write.
+
 ### `state save <name>`
 Captures repeatable browser state for the target tab. Saves cookies applicable to the current page plus `localStorage` and `sessionStorage` for the current origin into a JSON snapshot. Named snapshots default to `~/.config/chromium-bridge/states/<name>.json`; `--path` can override the file location.
 

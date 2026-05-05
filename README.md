@@ -21,6 +21,7 @@ Works with **Brave**, **Chrome**, and **Chromium** — any browser that speaks C
 | `chromium-bridge snapshot` | Dump the page accessibility tree with stable refs |
 | `chromium-bridge network list` | Reload or navigate and list captured network requests |
 | `chromium-bridge network inspect <matcher>` | Reload or navigate and inspect one matched request |
+| `chromium-bridge ingest <url>` | Write extracted page markdown into a corky conversations corpus |
 | `chromium-bridge state save <name>` | Save cookies plus local/session storage |
 | `chromium-bridge state load <name>` | Restore cookies plus local/session storage |
 | `chromium-bridge state list` | List saved state snapshots |
@@ -59,6 +60,24 @@ chromium-bridge network inspect graphql --url https://www.linkedin.com/feed/ --t
 ```
 
 `network list` and `network inspect` capture requests within a single CDP session so response bodies remain available for inspection. If `--url` is omitted, the command reloads the target tab. Use `--capture-timeout <ms>` and `--idle-ms <ms>` when heavy pages need a longer capture window.
+
+## Corky Ingest
+
+Use `ingest` when you want page content to land directly in corky's `mail/conversations/` corpus instead of manually redirecting stdout to a file.
+
+```bash
+# Resolve the corky data dir with corky's normal rules and write one conversation file
+chromium-bridge ingest https://example.com/docs/intro
+
+# Add routing metadata and push the new file to Ragie immediately
+chromium-bridge ingest https://example.com/docs/intro \
+  --labels web,research \
+  --accounts chromium-bridge,personal \
+  --route \
+  --ragie-push
+```
+
+By default the command writes a corky-style markdown file into the resolved `conversations/` directory, using the page title as the subject and a stable URL-derived filename slug. Pass `--corky-data` to target a different corky mailbox root, `--slug` to override the filename, or `--title` to override the generated subject. `--route` runs `corky sync routes` after the write so label-based mailbox fanout happens immediately. `--ragie-push` runs `corky ragie push` for the same mailbox root.
 
 ## Persistent State
 

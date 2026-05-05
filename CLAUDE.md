@@ -45,3 +45,4 @@ Extends the existence kernel vocabulary with domain-specific terms.
 - Default port 9222, configurable via `--port` or `CHROMIUM_BRIDGE_PORT`
 - Errors go to stderr, data goes to stdout
 - `--json` flag for machine-readable output on all commands
+- `ingest <url>` writes corky-style markdown into a resolved `mail/conversations/` corpus and can optionally trigger `corky sync routes` / `corky ragie push`
