@@ -111,9 +111,12 @@ chromium-bridge ingest https://example.com/docs/intro
 
 # Fan out routed mailboxes and push the new file to Ragie
 chromium-bridge ingest https://example.com/docs/intro --labels web,research --route --ragie-push
+
+# Also mirror the same page into a project-specific mailbox corpus
+chromium-bridge ingest https://example.com/docs/intro --mailbox project-alpha --labels web,project-alpha
 ```
 
-The command writes a corky-style markdown conversation file into the resolved corky `conversations/` directory. Pass `--corky-data` to target a different mailbox root, `--slug` to control the filename, or `--title` to override the generated subject.
+The command writes a corky-style markdown conversation file into the resolved corky `conversations/` directory. Pass `--corky-data` to target a different mailbox root, `--slug` to control the filename, or `--title` to override the generated subject. `--mailbox <name>` also copies the same file into `mailboxes/<name>/conversations/`, which is useful when corky's sift backends are split into per-project corpora for tighter search results.
 
 ## State
 

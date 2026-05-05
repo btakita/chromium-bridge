@@ -12,8 +12,9 @@
 //! - Screenshot and markdown commands use `LoadEventFired` event streaming for page load
 //!   detection instead of fixed delays.
 //! - `cmd_markdown` injects a DOM walker JS that converts page content to clean markdown.
-//! - `cmd_ingest` writes extracted page markdown into a corky conversations corpus and can
-//!   optionally trigger `corky sync routes` / `corky ragie push`.
+//! - `cmd_ingest` writes extracted page markdown into a corky conversations corpus, can
+//!   optionally mirror the same document into a project mailbox corpus, and can optionally
+//!   trigger `corky sync routes` / `corky ragie push`.
 //! - `state save/load/list` persists cookies plus local/session storage for repeatable
 //!   authenticated workflows and lightweight profile-like reuse.
 //! - `cmd_setup` detects installed Chromium browsers and checks debugging flag status.
@@ -52,6 +53,7 @@
 //! - network_list_reload: `chromium-bridge network list --tab linkedin` → reloads tab and lists requests
 //! - network_inspect_match: `chromium-bridge network inspect graphql --tab linkedin` → reloads tab and prints matched request details
 //! - ingest_writes_corky_doc: `chromium-bridge ingest https://example.com` → writes a corky-style markdown doc into `mail/conversations/`
+//! - ingest_mailbox_copy: `chromium-bridge ingest https://example.com --mailbox work` → also writes the same doc into `mail/mailboxes/work/conversations/`
 //! - state_save_named: `chromium-bridge state save linkedin-auth --tab linkedin` → writes JSON snapshot
 //! - state_load_named: `chromium-bridge state load linkedin-auth --tab linkedin` → restores cookies + storage
 //! - state_list: `chromium-bridge state list` → enumerates named snapshots
@@ -206,6 +208,9 @@ enum Command {
         /// Optional explicit corky data dir (defaults to corky's normal resolution order)
         #[arg(long)]
         corky_data: Option<String>,
+        /// Optional project mailbox that should receive a copy under mailboxes/<name>/conversations/
+        #[arg(long)]
+        mailbox: Option<String>,
         /// Run `corky sync routes` after writing the document
         #[arg(long)]
         route: bool,
@@ -526,6 +531,10 @@ struct ExtractedPage {
 #[serde(rename_all = "camelCase")]
 struct IngestOutput {
     path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mailbox: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mailbox_path: Option<String>,
     corky_data_dir: String,
     slug: String,
     subject: String,
@@ -554,6 +563,7 @@ struct IngestRequest<'a> {
     labels_raw: &'a str,
     accounts_raw: &'a str,
     corky_data_override: Option<&'a str>,
+    mailbox: Option<&'a str>,
     route: bool,
     ragie_push: bool,
     ragie_full: bool,
@@ -672,6 +682,19 @@ fn validate_state_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_mailbox_name(name: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        bail!("Mailbox name cannot be empty");
+    }
+    if name.contains('/') || name.contains('\\') {
+        bail!("Mailbox names cannot contain path separators");
+    }
+    if name == "." || name == ".." {
+        bail!("Mailbox names cannot be '.' or '..'");
+    }
+    Ok(())
+}
+
 fn normalize_csv_values(raw: &str) -> Vec<String> {
     raw.split(',')
         .map(str::trim)
@@ -738,6 +761,14 @@ fn resolve_ingest_slug(explicit_slug: Option<&str>, url: &str, title: &str) -> R
         bail!("Unable to derive a filename slug; pass --slug explicitly");
     }
     Ok(slug)
+}
+
+fn mailbox_conversations_dir(corky_data_dir: &Path, mailbox: &str) -> Result<PathBuf> {
+    validate_mailbox_name(mailbox)?;
+    Ok(corky_data_dir
+        .join("mailboxes")
+        .join(mailbox)
+        .join("conversations"))
 }
 
 fn render_ingest_document(document: &IngestDocument<'_>) -> String {
@@ -1819,8 +1850,24 @@ async fn cmd_ingest(cli: &Cli, request: &IngestRequest<'_>) -> Result<()> {
         )
     })?;
     let path = conversations_dir.join(format!("{slug}.md"));
-    std::fs::write(&path, document)
+    std::fs::write(&path, &document)
         .with_context(|| format!("Failed to write {}", path.display()))?;
+
+    let mailbox_path = if let Some(mailbox) = request.mailbox {
+        let mailbox_conversations_dir = mailbox_conversations_dir(&corky_data_dir, mailbox)?;
+        std::fs::create_dir_all(&mailbox_conversations_dir).with_context(|| {
+            format!(
+                "Failed to create corky mailbox conversations dir {}",
+                mailbox_conversations_dir.display()
+            )
+        })?;
+        let mailbox_path = mailbox_conversations_dir.join(format!("{slug}.md"));
+        std::fs::write(&mailbox_path, &document)
+            .with_context(|| format!("Failed to write {}", mailbox_path.display()))?;
+        Some(mailbox_path)
+    } else {
+        None
+    };
 
     if request.route {
         run_corky_command(&corky_data_dir, &["sync", "routes"])?;
@@ -1835,6 +1882,8 @@ async fn cmd_ingest(cli: &Cli, request: &IngestRequest<'_>) -> Result<()> {
 
     let output = IngestOutput {
         path: path.display().to_string(),
+        mailbox: request.mailbox.map(ToString::to_string),
+        mailbox_path: mailbox_path.as_ref().map(|path| path.display().to_string()),
         corky_data_dir: corky_data_dir.display().to_string(),
         slug,
         subject,
@@ -1850,6 +1899,11 @@ async fn cmd_ingest(cli: &Cli, request: &IngestRequest<'_>) -> Result<()> {
         println!("Ingested {} into {}", output.source_url, output.path);
         println!("Subject: {}", output.subject);
         println!("Corky data dir: {}", output.corky_data_dir);
+        if let (Some(mailbox), Some(mailbox_path)) =
+            (output.mailbox.as_deref(), output.mailbox_path.as_deref())
+        {
+            println!("Mailbox copy: {} -> {}", mailbox, mailbox_path);
+        }
         if output.routed {
             println!("Post-step: ran `corky sync routes`");
         }
@@ -2781,6 +2835,23 @@ mod tests {
     }
 
     #[test]
+    fn mailbox_conversations_dir_stays_under_corky_mailboxes() {
+        let path = mailbox_conversations_dir(Path::new("/tmp/mail"), "project-alpha")
+            .expect("mailbox conversations dir");
+        assert_eq!(
+            path,
+            PathBuf::from("/tmp/mail/mailboxes/project-alpha/conversations")
+        );
+    }
+
+    #[test]
+    fn mailbox_names_reject_path_separators() {
+        let err = mailbox_conversations_dir(Path::new("/tmp/mail"), "nested/project")
+            .expect_err("expected invalid mailbox name");
+        assert!(err.to_string().contains("path separators"));
+    }
+
+    #[test]
     fn ingest_slug_defaults_to_host_and_path() {
         let slug = resolve_ingest_slug(
             None,
@@ -3006,6 +3077,7 @@ async fn main() -> Result<()> {
             labels,
             accounts,
             corky_data,
+            mailbox,
             route,
             ragie_push,
             ragie_full,
@@ -3020,6 +3092,7 @@ async fn main() -> Result<()> {
                     labels_raw: labels,
                     accounts_raw: accounts,
                     corky_data_override: corky_data.as_deref(),
+                    mailbox: mailbox.as_deref(),
                     route: *route,
                     ragie_push: *ragie_push,
                     ragie_full: *ragie_full,

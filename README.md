@@ -75,9 +75,31 @@ chromium-bridge ingest https://example.com/docs/intro \
   --accounts chromium-bridge,personal \
   --route \
   --ragie-push
+
+# Keep the shared root corpus, and also copy into a project mailbox corpus
+chromium-bridge ingest https://example.com/docs/intro \
+  --mailbox project-alpha \
+  --labels web,project-alpha
 ```
 
-By default the command writes a corky-style markdown file into the resolved `conversations/` directory, using the page title as the subject and a stable URL-derived filename slug. Pass `--corky-data` to target a different corky mailbox root, `--slug` to override the filename, or `--title` to override the generated subject. `--route` runs `corky sync routes` after the write so label-based mailbox fanout happens immediately. `--ragie-push` runs `corky ragie push` for the same mailbox root.
+By default the command writes a corky-style markdown file into the resolved `conversations/` directory, using the page title as the subject and a stable URL-derived filename slug. Pass `--corky-data` to target a different corky mailbox root, `--slug` to override the filename, or `--title` to override the generated subject. `--mailbox <name>` also copies the same file into `mailboxes/<name>/conversations/` so one ingest can feed both the shared corpus and a project-specific corpus. `--route` runs `corky sync routes` after the root write so label-based mailbox fanout still happens immediately. `--ragie-push` runs `corky ragie push` for the same mailbox root.
+
+For multi-project local search, point separate corky sift backends at those mailbox corpora:
+
+```toml
+[search]
+default_backends = ["shared", "project-alpha"]
+
+[search.backends.shared]
+type = "sift"
+index_path = "conversations"
+
+[search.backends.project-alpha]
+type = "sift"
+index_path = "mailboxes/project-alpha/conversations"
+```
+
+That keeps the shared root corpus searchable while giving each project an isolated mailbox corpus for tighter retrieval.
 
 ## Persistent State
 
