@@ -59,6 +59,15 @@ Polls for a CSS selector to appear in the DOM. Default timeout: 10 seconds (`--w
 ### `snapshot`
 Dumps the page accessibility tree via CDP `Accessibility.getFullAXTree`. Human-readable output shows `[role] name` for each node. Supports `--depth <n>` to limit tree depth and `--json` for full AXNode array.
 
+### `state save <name>`
+Captures repeatable browser state for the target tab. Saves cookies applicable to the current page plus `localStorage` and `sessionStorage` for the current origin into a JSON snapshot. Named snapshots default to `~/.config/chromium-bridge/states/<name>.json`; `--path` can override the file location.
+
+### `state load <name>`
+Restores a previously-saved JSON snapshot. Applies cookies first, then navigates the target tab to each saved origin URL, restores `localStorage` and `sessionStorage`, and reloads so apps bootstrap with the restored state.
+
+### `state list`
+Lists named state snapshots in the local state directory. Supports `--json`.
+
 ### `skill install`
 Installs the bundled SKILL.md to the project's `.claude/skills/chromium-bridge/` directory. Detects the project root via git superproject or toplevel. The SKILL.md is embedded at build time via `include_str!()`.
 
@@ -76,6 +85,7 @@ Interactive setup wizard:
 |----------|---------|-------------|
 | `CHROMIUM_BRIDGE_PORT` | `9222` | CDP port |
 | `CHROMIUM_BRIDGE_HOST` | `127.0.0.1` | CDP host |
+| `CHROMIUM_BRIDGE_STATE_DIR` | `~/.config/chromium-bridge/states` | Directory for named state snapshots |
 
 ### CLI Flags
 

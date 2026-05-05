@@ -19,10 +19,30 @@ Works with **Brave**, **Chrome**, and **Chromium** — any browser that speaks C
 | `chromium-bridge select-tab <pattern>` | Activate a tab by index or pattern |
 | `chromium-bridge wait <selector>` | Wait for a CSS selector to appear |
 | `chromium-bridge snapshot` | Dump the page accessibility tree |
+| `chromium-bridge state save <name>` | Save cookies plus local/session storage |
+| `chromium-bridge state load <name>` | Restore cookies plus local/session storage |
+| `chromium-bridge state list` | List saved state snapshots |
 | `chromium-bridge setup` | Configure browser for remote debugging |
 | `chromium-bridge skill install` | Install SKILL.md to the project's Claude skills |
 
 All commands accept `--tab <index|pattern>` to target a specific tab, `--json` for machine-readable output, and `--timeout <ms>` to override the default 5s timeout.
+
+## Persistent State
+
+Use named state snapshots for lightweight persistent browser profiles across sessions:
+
+```bash
+# Save cookies + storage from the current LinkedIn tab
+chromium-bridge state save linkedin-auth --tab linkedin
+
+# Restore that state later into a fresh tab
+chromium-bridge state load linkedin-auth --tab linkedin
+
+# Inspect saved snapshots
+chromium-bridge state list
+```
+
+Named snapshots are stored under `~/.config/chromium-bridge/states/` by default. Override that with `CHROMIUM_BRIDGE_STATE_DIR=/path/to/states`. Use `--path /tmp/custom.json` on `state save/load` when you want an explicit file location.
 
 ## Setup
 

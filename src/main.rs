@@ -5,13 +5,15 @@
 //! - `Cli` struct holds global options (`--host`, `--port`, `--timeout`, `--json`)
 //!   and a `Command` subcommand enum.
 //! - Commands: `Check`, `List`, `Navigate`, `Evaluate`, `Screenshot`, `Markdown`, `Setup`,
-//!   `Click`, `Type`, `SelectTab`, `Wait`, `Snapshot`, `Skill`.
+//!   `Click`, `Type`, `SelectTab`, `Wait`, `Snapshot`, `State`, `Skill`.
 //! - CDP communication: HTTP (`/json/*`) for tab listing/version, WebSocket via `cdpkit`
 //!   for page-level commands (navigate, evaluate, screenshot, input).
 //! - `connect_to_tab` creates a cdpkit `CDP` client and attaches to a specific tab by index.
 //! - Screenshot and markdown commands use `LoadEventFired` event streaming for page load
 //!   detection instead of fixed delays.
 //! - `cmd_markdown` injects a DOM walker JS that converts page content to clean markdown.
+//! - `state save/load/list` persists cookies plus local/session storage for repeatable
+//!   authenticated workflows and lightweight profile-like reuse.
 //! - `cmd_setup` detects installed Chromium browsers and checks debugging flag status.
 //! - `cmd_skill_install` writes the bundled SKILL.md (embedded via `include_str!`) to
 //!   `.claude/skills/chromium-bridge/SKILL.md` in the project root.
@@ -23,6 +25,7 @@
 //!   Ambiguous patterns (multiple matches) produce an error listing matches.
 //! - CDP connection timeout is configurable via `--timeout` (default 5000ms).
 //! - Env vars `CHROMIUM_BRIDGE_HOST` and `CHROMIUM_BRIDGE_PORT` override defaults.
+//! - Env var `CHROMIUM_BRIDGE_STATE_DIR` overrides the default state snapshot directory.
 //!
 //! ## Evals
 //! - check_responds: `chromium-bridge check` with live browser → prints OK + version
@@ -42,6 +45,9 @@
 //! - select_tab_by_pattern: `chromium-bridge select-tab linkedin` → activates matching tab
 //! - wait_for_selector: `chromium-bridge wait "div.loaded"` → waits until element exists
 //! - snapshot_ax_tree: `chromium-bridge snapshot` → prints accessibility tree
+//! - state_save_named: `chromium-bridge state save linkedin-auth --tab linkedin` → writes JSON snapshot
+//! - state_load_named: `chromium-bridge state load linkedin-auth --tab linkedin` → restores cookies + storage
+//! - state_list: `chromium-bridge state list` → enumerates named snapshots
 //! - skill_install: `chromium-bridge skill install` → writes SKILL.md to project .claude/skills/
 //! - skill_check: `chromium-bridge skill check` → reports if installed version matches binary
 
@@ -51,9 +57,14 @@ use cdpkit::CDP;
 use clap::{Parser, Subcommand};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "chromium-bridge", about = "Bridge agents to Chromium browsers via CDP")]
+#[command(
+    name = "chromium-bridge",
+    about = "Bridge agents to Chromium browsers via CDP"
+)]
 struct Cli {
     /// CDP host
     #[arg(long, default_value = "127.0.0.1", env = "CHROMIUM_BRIDGE_HOST")]
@@ -159,6 +170,11 @@ enum Command {
         #[arg(long, default_value = "0")]
         tab: String,
     },
+    /// Save or restore persistent browser state snapshots
+    State {
+        #[command(subcommand)]
+        action: StateAction,
+    },
     /// Manage the Claude Code skill definition
     Skill {
         #[command(subcommand)]
@@ -174,6 +190,34 @@ enum SkillAction {
     Install,
     /// Check if installed skill matches this binary version
     Check,
+}
+
+#[derive(Subcommand)]
+enum StateAction {
+    /// Save cookies plus local/session storage into a named snapshot
+    Save {
+        /// Snapshot name; saved under the state dir unless --path is supplied
+        name: String,
+        /// Optional explicit output path
+        #[arg(long)]
+        path: Option<String>,
+        /// Target tab: index number or URL substring pattern (default: 0)
+        #[arg(long, default_value = "0")]
+        tab: String,
+    },
+    /// Restore cookies plus local/session storage from a snapshot
+    Load {
+        /// Snapshot name; loaded from the state dir unless --path is supplied
+        name: String,
+        /// Optional explicit input path
+        #[arg(long)]
+        path: Option<String>,
+        /// Target tab: index number or URL substring pattern (default: 0)
+        #[arg(long, default_value = "0")]
+        tab: String,
+    },
+    /// List saved snapshots in the local state dir
+    List,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -199,6 +243,44 @@ struct Tab {
     web_socket_debugger_url: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SavedBrowserState {
+    version: u32,
+    saved_at_unix_ms: u64,
+    active_url: String,
+    active_title: String,
+    cookies: Vec<cdpkit::network::types::CookieParam>,
+    origins: Vec<OriginStorageState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OriginStorageState {
+    origin: String,
+    url: String,
+    title: String,
+    local_storage: BTreeMap<String, String>,
+    session_storage: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PageStorageSnapshot {
+    href: String,
+    origin: String,
+    title: String,
+    local_storage: BTreeMap<String, String>,
+    session_storage: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StateListEntry {
+    name: String,
+    path: String,
+}
+
 fn base_url(cli: &Cli) -> String {
     format!("http://{}:{}", cli.host, cli.port)
 }
@@ -221,6 +303,224 @@ async fn get_tabs(cli: &Cli) -> Result<Vec<Tab>> {
         ))?;
     let tabs: Vec<Tab> = resp.json().await?;
     Ok(tabs)
+}
+
+fn expand_path_with_home(path: &str, home: Option<&str>) -> Result<PathBuf> {
+    if let Some(stripped) = path.strip_prefix("~/") {
+        let home = home.context("HOME is not set")?;
+        return Ok(PathBuf::from(home).join(stripped));
+    }
+    Ok(PathBuf::from(path))
+}
+
+fn expand_path(path: &str) -> Result<PathBuf> {
+    let home = std::env::var("HOME").ok();
+    expand_path_with_home(path, home.as_deref())
+}
+
+fn state_root_from_env(
+    override_dir: Option<&str>,
+    xdg_config_home: Option<&str>,
+    home: Option<&str>,
+) -> Result<PathBuf> {
+    if let Some(dir) = override_dir {
+        return expand_path_with_home(dir, home);
+    }
+
+    if let Some(config_home) = xdg_config_home {
+        return Ok(PathBuf::from(config_home)
+            .join("chromium-bridge")
+            .join("states"));
+    }
+
+    let home = home.context("HOME is not set")?;
+    Ok(PathBuf::from(home)
+        .join(".config")
+        .join("chromium-bridge")
+        .join("states"))
+}
+
+fn state_root() -> Result<PathBuf> {
+    let override_dir = std::env::var("CHROMIUM_BRIDGE_STATE_DIR").ok();
+    let xdg_config_home = std::env::var("XDG_CONFIG_HOME").ok();
+    let home = std::env::var("HOME").ok();
+    state_root_from_env(
+        override_dir.as_deref(),
+        xdg_config_home.as_deref(),
+        home.as_deref(),
+    )
+}
+
+fn validate_state_name(name: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        bail!("Snapshot name cannot be empty");
+    }
+    if name.contains('/') || name.contains('\\') {
+        bail!("Snapshot names cannot contain path separators; use --path for explicit file paths");
+    }
+    Ok(())
+}
+
+fn resolve_state_path(name: &str, explicit_path: Option<&str>) -> Result<PathBuf> {
+    if let Some(path) = explicit_path {
+        return expand_path(path);
+    }
+
+    validate_state_name(name)?;
+    let file_name = if name.ends_with(".json") {
+        name.to_string()
+    } else {
+        format!("{name}.json")
+    };
+    Ok(state_root()?.join(file_name))
+}
+
+fn cookie_to_param(cookie: cdpkit::network::types::Cookie) -> cdpkit::network::types::CookieParam {
+    cdpkit::network::types::CookieParam {
+        name: cookie.name,
+        value: cookie.value,
+        url: None,
+        domain: Some(cookie.domain),
+        path: Some(cookie.path),
+        secure: Some(cookie.secure),
+        http_only: Some(cookie.http_only),
+        same_site: cookie.same_site,
+        expires: if cookie.session || cookie.expires < 0.0 {
+            None
+        } else {
+            Some(cookie.expires)
+        },
+        priority: Some(cookie.priority),
+        source_scheme: Some(cookie.source_scheme),
+        source_port: Some(cookie.source_port),
+        partition_key: cookie.partition_key,
+    }
+}
+
+async fn navigate_and_wait(cdp: &CDP, session: &str, url: &str) -> Result<()> {
+    cdpkit::page::methods::Enable::new()
+        .send(cdp, Some(session))
+        .await?;
+
+    let mut events = cdpkit::page::events::LoadEventFired::subscribe(cdp);
+    cdpkit::page::methods::Navigate::new(url)
+        .send(cdp, Some(session))
+        .await?;
+    tokio::time::timeout(std::time::Duration::from_secs(10), events.next())
+        .await
+        .context(format!("Timed out waiting for '{}' to load", url))?
+        .context("Page load event stream closed unexpectedly")?;
+    Ok(())
+}
+
+async fn reload_and_wait(cdp: &CDP, session: &str) -> Result<()> {
+    cdpkit::page::methods::Enable::new()
+        .send(cdp, Some(session))
+        .await?;
+
+    let mut events = cdpkit::page::events::LoadEventFired::subscribe(cdp);
+    cdpkit::page::methods::Reload::new()
+        .send(cdp, Some(session))
+        .await?;
+    tokio::time::timeout(std::time::Duration::from_secs(10), events.next())
+        .await
+        .context("Timed out waiting for page reload")?
+        .context("Page load event stream closed unexpectedly")?;
+    Ok(())
+}
+
+async fn snapshot_page_storage(cdp: &CDP, session: &str) -> Result<PageStorageSnapshot> {
+    let js = r#"
+    (() => {
+        const dumpStorage = storage => {
+            const out = {};
+            for (let i = 0; i < storage.length; i += 1) {
+                const key = storage.key(i);
+                if (key !== null) {
+                    out[key] = storage.getItem(key) ?? "";
+                }
+            }
+            return out;
+        };
+
+        return {
+            href: window.location.href,
+            origin: window.location.origin,
+            title: document.title,
+            localStorage: dumpStorage(window.localStorage),
+            sessionStorage: dumpStorage(window.sessionStorage),
+        };
+    })()
+    "#;
+
+    let result = cdpkit::runtime::methods::Evaluate::new(js)
+        .with_return_by_value(true)
+        .send(cdp, Some(session))
+        .await?;
+
+    let value = result
+        .result
+        .value
+        .context("Failed to read page storage snapshot")?;
+    let snapshot: PageStorageSnapshot =
+        serde_json::from_value(value).context("Failed to parse page storage snapshot")?;
+
+    if snapshot.origin == "null" {
+        bail!(
+            "Cannot save state for opaque origin '{}'; navigate to an http(s) page first",
+            snapshot.href
+        );
+    }
+
+    Ok(snapshot)
+}
+
+async fn apply_origin_storage_state(
+    cdp: &CDP,
+    session: &str,
+    origin_state: &OriginStorageState,
+) -> Result<()> {
+    let payload = serde_json::to_string(origin_state)?;
+    let js = format!(
+        r#"
+        (() => {{
+            const state = {payload};
+            if (window.location.origin !== state.origin) {{
+                throw new Error(`Origin mismatch: expected ${{state.origin}}, got ${{window.location.origin}}`);
+            }}
+
+            window.localStorage.clear();
+            for (const [key, value] of Object.entries(state.localStorage)) {{
+                window.localStorage.setItem(key, value);
+            }}
+
+            window.sessionStorage.clear();
+            for (const [key, value] of Object.entries(state.sessionStorage)) {{
+                window.sessionStorage.setItem(key, value);
+            }}
+
+            return {{
+                origin: window.location.origin,
+                localStorage: window.localStorage.length,
+                sessionStorage: window.sessionStorage.length,
+            }};
+        }})()
+        "#
+    );
+
+    let result = cdpkit::runtime::methods::Evaluate::new(&js)
+        .with_return_by_value(true)
+        .send(cdp, Some(session))
+        .await?;
+
+    if result.exception_details.is_some() {
+        bail!(
+            "Failed to restore storage for origin '{}'",
+            origin_state.origin
+        );
+    }
+
+    Ok(())
 }
 
 /// Resolve a tab selector: numeric index or URL substring match.
@@ -309,20 +609,25 @@ async fn cmd_list(cli: &Cli) -> Result<()> {
 
 async fn cmd_navigate(cli: &Cli, url: &str, tab_selector: &str) -> Result<()> {
     let (cdp, session) = connect_to_tab(cli, tab_selector).await?;
-
-    // Enable page domain for load events
     cdpkit::page::methods::Enable::new()
         .send(&cdp, Some(&session))
         .await?;
-
+    let mut events = cdpkit::page::events::LoadEventFired::subscribe(&cdp);
     let result = cdpkit::page::methods::Navigate::new(url)
         .send(&cdp, Some(&session))
         .await?;
+    tokio::time::timeout(std::time::Duration::from_secs(10), events.next())
+        .await
+        .context(format!("Timed out waiting for '{}' to load", url))?
+        .context("Page load event stream closed unexpectedly")?;
 
     if cli.json {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "frameId": result.frame_id,
-        }))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "frameId": result.frame_id,
+            }))?
+        );
     } else {
         println!("Navigated to {}", url);
     }
@@ -364,21 +669,7 @@ async fn cmd_screenshot(
     let (cdp, session) = connect_to_tab(cli, tab_selector).await?;
 
     if let Some(url) = url {
-        cdpkit::page::methods::Enable::new()
-            .send(&cdp, Some(&session))
-            .await?;
-
-        cdpkit::page::methods::Navigate::new(url)
-            .send(&cdp, Some(&session))
-            .await?;
-
-        // Wait for page load event
-        let mut events = cdpkit::page::events::LoadEventFired::subscribe(&cdp);
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            events.next(),
-        )
-        .await;
+        navigate_and_wait(&cdp, &session, url).await?;
     }
 
     let result = cdpkit::page::methods::CaptureScreenshot::new()
@@ -397,22 +688,7 @@ async fn cmd_screenshot(
 
 async fn cmd_markdown(cli: &Cli, url: &str, tab_selector: &str) -> Result<()> {
     let (cdp, session) = connect_to_tab(cli, tab_selector).await?;
-
-    cdpkit::page::methods::Enable::new()
-        .send(&cdp, Some(&session))
-        .await?;
-
-    cdpkit::page::methods::Navigate::new(url)
-        .send(&cdp, Some(&session))
-        .await?;
-
-    // Wait for page load event instead of fixed sleep
-    let mut events = cdpkit::page::events::LoadEventFired::subscribe(&cdp);
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        events.next(),
-    )
-    .await;
+    navigate_and_wait(&cdp, &session, url).await?;
 
     let js = r#"
     (function() {
@@ -529,11 +805,14 @@ async fn cmd_click(cli: &Cli, selector: &str, tab_selector: &str) -> Result<()> 
         .await?;
 
     if cli.json {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "selector": selector,
-            "x": cx,
-            "y": cy,
-        }))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "selector": selector,
+                "x": cx,
+                "y": cy,
+            }))?
+        );
     } else {
         println!("Clicked '{}' at ({:.0}, {:.0})", selector, cx, cy);
     }
@@ -613,11 +892,14 @@ async fn cmd_type(cli: &Cli, selector: &str, text: &str, tab_selector: &str) -> 
     }
 
     if cli.json {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "selector": selector,
-            "length": text.len(),
-            "paragraphs": paragraphs.len(),
-        }))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "selector": selector,
+                "length": text.len(),
+                "paragraphs": paragraphs.len(),
+            }))?
+        );
     } else {
         println!(
             "Typed {} chars ({} paragraph{}) into '{}'",
@@ -648,11 +930,14 @@ async fn cmd_select_tab(cli: &Cli, selector: &str) -> Result<()> {
     }
 
     if cli.json {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "id": tab.id,
-            "title": tab.title,
-            "url": tab.url,
-        }))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "id": tab.id,
+                "title": tab.title,
+                "url": tab.url,
+            }))?
+        );
     } else {
         println!("Activated: {} — {}", tab.title, tab.url);
     }
@@ -679,10 +964,13 @@ async fn cmd_wait(cli: &Cli, selector: &str, timeout_ms: u64, tab_selector: &str
 
         if result.result.value == Some(serde_json::Value::Bool(true)) {
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                    "selector": selector,
-                    "found": true,
-                }))?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "selector": selector,
+                        "found": true,
+                    }))?
+                );
             } else {
                 println!("Found '{}'", selector);
             }
@@ -690,7 +978,11 @@ async fn cmd_wait(cli: &Cli, selector: &str, timeout_ms: u64, tab_selector: &str
         }
 
         if std::time::Instant::now() >= deadline {
-            bail!("Timeout waiting for selector '{}' after {}ms", selector, timeout_ms);
+            bail!(
+                "Timeout waiting for selector '{}' after {}ms",
+                selector,
+                timeout_ms
+            );
         }
 
         tokio::time::sleep(poll_interval).await;
@@ -748,6 +1040,174 @@ async fn cmd_snapshot(cli: &Cli, depth: Option<i64>, tab_selector: &str) -> Resu
     Ok(())
 }
 
+async fn cmd_state_save(
+    cli: &Cli,
+    name: &str,
+    explicit_path: Option<&str>,
+    tab_selector: &str,
+) -> Result<()> {
+    let path = resolve_state_path(name, explicit_path)?;
+    let (cdp, session) = connect_to_tab(cli, tab_selector).await?;
+    let page = snapshot_page_storage(&cdp, &session).await?;
+    let cookies = cdpkit::network::methods::GetCookies::new()
+        .with_urls(vec![page.href.clone()])
+        .send(&cdp, Some(&session))
+        .await?
+        .cookies
+        .into_iter()
+        .map(cookie_to_param)
+        .collect::<Vec<_>>();
+
+    let state = SavedBrowserState {
+        version: 1,
+        saved_at_unix_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .context("System clock is before UNIX_EPOCH")?
+            .as_millis()
+            .try_into()
+            .context("Timestamp overflow while saving state")?,
+        active_url: page.href.clone(),
+        active_title: page.title.clone(),
+        cookies,
+        origins: vec![OriginStorageState {
+            origin: page.origin,
+            url: page.href,
+            title: page.title,
+            local_storage: page.local_storage,
+            session_storage: page.session_storage,
+        }],
+    };
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, serde_json::to_vec_pretty(&state)?)?;
+
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "name": name,
+                "path": path.display().to_string(),
+                "cookies": state.cookies.len(),
+                "origins": state.origins.len(),
+                "activeUrl": state.active_url,
+            }))?
+        );
+    } else {
+        println!(
+            "Saved state '{}' to {} ({} cookies, {} origin{})",
+            name,
+            path.display(),
+            state.cookies.len(),
+            state.origins.len(),
+            if state.origins.len() == 1 { "" } else { "s" }
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_state_load(
+    cli: &Cli,
+    name: &str,
+    explicit_path: Option<&str>,
+    tab_selector: &str,
+) -> Result<()> {
+    let path = resolve_state_path(name, explicit_path)?;
+    let state: SavedBrowserState = serde_json::from_str(
+        &std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read state file {}", path.display()))?,
+    )
+    .with_context(|| format!("Failed to parse state file {}", path.display()))?;
+
+    if state.version != 1 {
+        bail!(
+            "Unsupported state snapshot version {} in {}",
+            state.version,
+            path.display()
+        );
+    }
+
+    let (cdp, session) = connect_to_tab(cli, tab_selector).await?;
+
+    if !state.cookies.is_empty() {
+        cdpkit::network::methods::SetCookies::new(state.cookies.clone())
+            .send(&cdp, Some(&session))
+            .await?;
+    }
+
+    for origin_state in &state.origins {
+        navigate_and_wait(&cdp, &session, &origin_state.url).await?;
+        apply_origin_storage_state(&cdp, &session, origin_state).await?;
+        reload_and_wait(&cdp, &session).await?;
+    }
+
+    if state.origins.last().map(|origin| origin.url.as_str()) != Some(state.active_url.as_str()) {
+        navigate_and_wait(&cdp, &session, &state.active_url).await?;
+    }
+
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "name": name,
+                "path": path.display().to_string(),
+                "cookies": state.cookies.len(),
+                "origins": state.origins.len(),
+                "activeUrl": state.active_url,
+            }))?
+        );
+    } else {
+        println!(
+            "Loaded state '{}' from {} ({} cookies, {} origin{})",
+            name,
+            path.display(),
+            state.cookies.len(),
+            state.origins.len(),
+            if state.origins.len() == 1 { "" } else { "s" }
+        );
+    }
+    Ok(())
+}
+
+fn cmd_state_list(cli: &Cli) -> Result<()> {
+    let root = state_root()?;
+    let mut entries = Vec::new();
+
+    if root.exists() {
+        for entry in std::fs::read_dir(&root)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+
+            let name = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| path.display().to_string());
+            entries.push(StateListEntry {
+                name,
+                path: path.display().to_string(),
+            });
+        }
+    }
+
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+
+    if cli.json {
+        println!("{}", serde_json::to_string_pretty(&entries)?);
+    } else if entries.is_empty() {
+        println!("No saved states in {}", root.display());
+    } else {
+        for entry in entries {
+            println!("{} — {}", entry.name, entry.path);
+        }
+    }
+    Ok(())
+}
+
 /// The SKILL.md content bundled at build time.
 const BUNDLED_SKILL: &str = include_str!("../SKILL.md");
 
@@ -790,20 +1250,26 @@ fn cmd_skill_install(cli: &Cli) -> Result<()> {
 
     if already_current {
         if cli.json {
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                "path": path.display().to_string(),
-                "updated": false,
-            }))?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "path": path.display().to_string(),
+                    "updated": false,
+                }))?
+            );
         } else {
             println!("Skill already up to date: {}", path.display());
         }
     } else {
         std::fs::write(&path, BUNDLED_SKILL)?;
         if cli.json {
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                "path": path.display().to_string(),
-                "updated": true,
-            }))?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "path": path.display().to_string(),
+                    "updated": true,
+                }))?
+            );
         } else {
             println!("Skill installed: {}", path.display());
         }
@@ -821,10 +1287,13 @@ fn cmd_skill_check(cli: &Cli) -> Result<()> {
             .unwrap_or(false);
 
     if cli.json {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "path": path.display().to_string(),
-            "up_to_date": up_to_date,
-        }))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "path": path.display().to_string(),
+                "up_to_date": up_to_date,
+            }))?
+        );
     } else if up_to_date {
         println!("Skill up to date: {}", path.display());
     } else if path.exists() {
@@ -887,6 +1356,45 @@ fn cmd_setup() -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn named_state_paths_live_under_config_dir() {
+        let root = state_root_from_env(
+            Some("/tmp/chromium-bridge-state-tests"),
+            None,
+            Some("/tmp/home"),
+        )
+        .expect("state root");
+        let path = root.join("linkedin-auth.json");
+        assert_eq!(
+            path,
+            PathBuf::from("/tmp/chromium-bridge-state-tests/linkedin-auth.json")
+        );
+    }
+
+    #[test]
+    fn explicit_state_path_expands_home() {
+        let path = expand_path_with_home("~/saved/state.json", Some("/tmp/chromium-bridge-home"))
+            .expect("state path");
+        assert_eq!(
+            path,
+            PathBuf::from("/tmp/chromium-bridge-home/saved/state.json")
+        );
+    }
+
+    #[test]
+    fn named_state_rejects_path_separators() {
+        let err = resolve_state_path("nested/state", None).expect_err("expected invalid name");
+        assert!(
+            err.to_string()
+                .contains("Snapshot names cannot contain path separators")
+        );
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -912,6 +1420,15 @@ async fn main() -> Result<()> {
             tab,
         } => cmd_wait(&cli, selector, *wait_timeout, tab).await,
         Command::Snapshot { depth, tab } => cmd_snapshot(&cli, *depth, tab).await,
+        Command::State { action } => match action {
+            StateAction::Save { name, path, tab } => {
+                cmd_state_save(&cli, name, path.as_deref(), tab).await
+            }
+            StateAction::Load { name, path, tab } => {
+                cmd_state_load(&cli, name, path.as_deref(), tab).await
+            }
+            StateAction::List => cmd_state_list(&cli),
+        },
         Command::Skill { action } => match action {
             SkillAction::Install => cmd_skill_install(&cli),
             SkillAction::Check => cmd_skill_check(&cli),

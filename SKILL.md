@@ -17,6 +17,9 @@ CLI for browser automation via Chrome DevTools Protocol (CDP). Direct WebSocket 
 | `select-tab '<pattern>'` | Activate a tab by index or pattern |
 | `wait '<selector>'` | Wait for a CSS selector to appear |
 | `snapshot` | Dump the page accessibility tree |
+| `state save <name>` | Save cookies plus local/session storage |
+| `state load <name>` | Restore cookies plus local/session storage |
+| `state list` | List saved state snapshots |
 | `setup` | Configure browser for remote debugging |
 
 ## Tab Selector
@@ -79,6 +82,23 @@ Dumps the page accessibility tree. Human-readable output shows `[role] name` for
 chromium-bridge snapshot --tab messenger
 chromium-bridge snapshot --depth 5 --json
 ```
+
+## State
+
+Save and restore lightweight persistent browser profiles for authenticated workflows. Each snapshot stores cookies applicable to the current page plus `localStorage` and `sessionStorage` for the current origin.
+
+```bash
+# Save the current app session
+chromium-bridge state save linkedin-auth --tab linkedin
+
+# Restore it later into a fresh tab
+chromium-bridge state load linkedin-auth --tab linkedin
+
+# Inspect what is available
+chromium-bridge state list
+```
+
+Named snapshots live under `~/.config/chromium-bridge/states/` by default. Override that directory with `CHROMIUM_BRIDGE_STATE_DIR=/path/to/states`, or use `--path /tmp/custom.json` on `state save/load` for an explicit file.
 
 ## Chatbox Formatting
 
@@ -157,6 +177,7 @@ chromium-bridge snapshot
 |------|---------|
 | CDP host | `127.0.0.1` (env: `CHROMIUM_BRIDGE_HOST`) |
 | CDP port | `9222` (env: `CHROMIUM_BRIDGE_PORT`) |
+| State dir | `~/.config/chromium-bridge/states` (env: `CHROMIUM_BRIDGE_STATE_DIR`) |
 | Timeout | `5000ms` (`--timeout`) |
 | JSON output | `--json` flag on any command |
 
