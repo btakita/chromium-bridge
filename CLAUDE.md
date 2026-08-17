@@ -47,7 +47,7 @@ Extends the existence kernel vocabulary with domain-specific terms.
 - `--json` flag for machine-readable output on all commands
 - `ingest <url>` writes corky-style markdown into a resolved `mail/conversations/` corpus, can optionally mirror that document into `mailboxes/<name>/conversations/` for project-specific search corpora, and can optionally trigger `corky sync routes` / `corky ragie push`
 
-<!-- tsift:code-navigation v=0.1.64 -->
+<!-- tsift:code-navigation v=0.1.77 -->
 ## Code Navigation
 
 Keep this block self-contained for Codex/OpenCode prompt reuse. If this repository also ships current `.claude/skills/tsift/SKILL.md` or `runbooks/code-navigation.md`, use those deeper runbooks for command detail instead of expanding this block.
