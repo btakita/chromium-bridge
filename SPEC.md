@@ -120,6 +120,8 @@ Interactive setup wizard:
 - `cargo install chromium-bridge` installs from crates.io
 - `curl -sSf https://raw.githubusercontent.com/btakita/chromium-bridge/main/install.sh | sh` installs the latest compatible prebuilt release asset directly from GitHub Releases
 - `brew tap btakita/tap && brew install chromium-bridge` installs the tagged release binaries through the `btakita/homebrew-tap` Homebrew tap on macOS/Linux (`x86_64` and `aarch64`)
+- `irm https://raw.githubusercontent.com/btakita/chromium-bridge/main/install.ps1 | iex` installs the latest Windows x64/ARM64 release package under the current user's local application directory, verifies the GitHub release SHA-256 digest when published, and adds the install directory to the user `PATH`
+- Tagged GitHub releases publish `.zip` packages containing `chromium-bridge.exe` for `x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc`, alongside the existing macOS/Linux archives
 
 ## Error Handling
 

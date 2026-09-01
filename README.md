@@ -144,7 +144,13 @@ cargo install chromium-bridge
 curl -sSf https://raw.githubusercontent.com/btakita/chromium-bridge/main/install.sh | sh
 ```
 
-The Homebrew tap ships prebuilt binaries from tagged GitHub releases for macOS and Linux on `x86_64` and `aarch64`.
+On Windows, install the latest prebuilt package from PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/btakita/chromium-bridge/main/install.ps1 | iex
+```
+
+The PowerShell installer selects the x64 or ARM64 package, verifies its GitHub release digest, installs `chromium-bridge.exe` under `%LOCALAPPDATA%\Programs\chromium-bridge`, and adds that directory to the user `PATH`. Tagged releases ship prebuilt binaries for Windows, macOS, and Linux on `x86_64`/x64 and `aarch64`/ARM64.
 
 ## License
 
