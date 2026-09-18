@@ -78,15 +78,25 @@ use std::path::PathBuf;
 )]
 struct Cli {
     /// CDP host
-    #[arg(long, default_value = "127.0.0.1", env = "CHROMIUM_BRIDGE_HOST")]
+    #[arg(
+        long,
+        global = true,
+        default_value = "127.0.0.1",
+        env = "CHROMIUM_BRIDGE_HOST"
+    )]
     host: String,
 
     /// CDP port
-    #[arg(long, default_value = "9222", env = "CHROMIUM_BRIDGE_PORT")]
+    #[arg(
+        long,
+        global = true,
+        default_value = "9222",
+        env = "CHROMIUM_BRIDGE_PORT"
+    )]
     port: u16,
 
     /// Connection timeout in milliseconds
-    #[arg(long, default_value = "5000")]
+    #[arg(long, global = true, default_value = "5000")]
     timeout: u64,
 
     /// Output JSON instead of human-readable text
@@ -2712,6 +2722,62 @@ fn cmd_setup() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn cdp_endpoint_env_fallbacks_are_declared() {
+        let command = Cli::command();
+        let host = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "host")
+            .expect("host argument");
+        let port = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "port")
+            .expect("port argument");
+
+        assert_eq!(host.get_env(), Some(OsStr::new("CHROMIUM_BRIDGE_HOST")));
+        assert_eq!(port.get_env(), Some(OsStr::new("CHROMIUM_BRIDGE_PORT")));
+    }
+
+    #[test]
+    fn cdp_endpoint_flags_are_global() {
+        let cli = Cli::try_parse_from([
+            "chromium-bridge",
+            "list",
+            "--host",
+            "browser.internal",
+            "--port",
+            "9223",
+            "--timeout",
+            "7500",
+        ])
+        .expect("global endpoint flags should parse after the subcommand");
+
+        assert_eq!(cli.host, "browser.internal");
+        assert_eq!(cli.port, 9223);
+        assert_eq!(cli.timeout, 7500);
+        assert!(matches!(cli.command, Command::List));
+        assert_eq!(base_url(&cli), "http://browser.internal:9223");
+    }
+
+    #[test]
+    fn cdp_endpoint_flags_keep_legacy_prefix_position() {
+        let cli = Cli::try_parse_from([
+            "chromium-bridge",
+            "--host",
+            "127.0.0.2",
+            "--port",
+            "9333",
+            "check",
+        ])
+        .expect("global endpoint flags should parse before the subcommand");
+
+        assert_eq!(cli.host, "127.0.0.2");
+        assert_eq!(cli.port, 9333);
+        assert!(matches!(cli.command, Command::Check));
+    }
 
     #[test]
     fn named_state_paths_live_under_config_dir() {

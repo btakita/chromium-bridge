@@ -13,7 +13,7 @@ Agent / Script
 chromium-bridge CLI
     │
     ▼ HTTP + WebSocket
-CDP endpoint (127.0.0.1:9222)
+CDP endpoint (configurable host and port; defaults to 127.0.0.1:9222)
     │
     ▼
 Brave / Chrome / Chromium
@@ -100,10 +100,10 @@ Interactive setup wizard:
 
 ### CLI Flags
 
-- `--port <N>` — override CDP port
-- `--host <addr>` — override CDP host
+- `--port <N>` — override CDP port; accepted before or after any subcommand
+- `--host <addr>` — override CDP host; accepted before or after any subcommand
 - `--json` — machine-readable JSON output
-- `--timeout <ms>` — connection timeout (default: 5000)
+- `--timeout <ms>` — connection timeout (default: 5000); accepted before or after any subcommand
 
 ## Dependencies
 
@@ -131,6 +131,6 @@ Interactive setup wizard:
 
 ## Security
 
-- CDP port binds to localhost only — no external exposure
+- The default CDP target is localhost. Using `--host` or `CHROMIUM_BRIDGE_HOST` to connect to another host makes transport security the operator's responsibility.
 - No secrets handled by the CLI itself
 - Screenshot output goes to local files only

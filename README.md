@@ -28,7 +28,16 @@ Works with **Brave**, **Chrome**, and **Chromium** — any browser that speaks C
 | `chromium-bridge setup` | Configure browser for remote debugging |
 | `chromium-bridge skill install` | Install SKILL.md to the project's Claude skills |
 
-All commands accept `--tab <index|pattern>` to target a specific tab, `--json` for machine-readable output, and `--timeout <ms>` to override the default 5s timeout.
+All commands accept `--tab <index|pattern>` where applicable. The global `--host`, `--port`, `--timeout`, and `--json` options may appear before or after any subcommand. `CHROMIUM_BRIDGE_HOST` and `CHROMIUM_BRIDGE_PORT` provide per-shell endpoint defaults:
+
+```bash
+# Both flag positions work
+chromium-bridge --port 9223 list
+chromium-bridge list --port 9223
+
+# Configure wrappers without threading flags through them
+CHROMIUM_BRIDGE_PORT=9223 chromium-bridge check
+```
 
 ## Accessibility Snapshot
 
