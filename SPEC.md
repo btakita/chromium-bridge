@@ -79,8 +79,17 @@ Restores a previously-saved JSON snapshot. Applies cookies first, then navigates
 ### `state list`
 Lists named state snapshots in the local state directory. Supports `--json`.
 
-### `skill install`
-Installs the bundled SKILL.md to the project's `.claude/skills/chromium-bridge/` directory. Detects the project root via git superproject or toplevel. The SKILL.md is embedded at build time via `include_str!()`.
+### `skill install [--harness <name>]`
+Installs the bundled SKILL.md to the selected harness's project skill directory.
+Supported harnesses are Claude (`.claude/skills`), Codex (`.codex/skills`),
+OpenCode (`.opencode/skills`), and Grok Build (`.grok/skills`). Claude remains
+the default for backward compatibility. Detects the project root via git
+superproject or toplevel. The SKILL.md is embedded at build time via
+`include_str!()`.
+
+### `skill check [--harness <name>]`
+Checks the selected harness's installed skill against the copy embedded in the
+binary. The harness choices and default are identical to `skill install`.
 
 ### `setup`
 Interactive setup wizard:
@@ -122,6 +131,7 @@ Interactive setup wizard:
 - `brew tap btakita/tap && brew install chromium-bridge` installs the tagged release binaries through the `btakita/homebrew-tap` Homebrew tap on macOS/Linux (`x86_64` and `aarch64`)
 - `irm https://raw.githubusercontent.com/btakita/chromium-bridge/main/install.ps1 | iex` installs the latest Windows x64/ARM64 release package under the current user's local application directory, verifies the GitHub release SHA-256 digest when published, and adds the install directory to the user `PATH`
 - Tagged GitHub releases publish `.zip` packages containing `chromium-bridge.exe` for `x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc`, alongside the existing macOS/Linux archives
+- `make release` runs checks and builds the optimized local release binary; `make publish` runs checks and publishes the current version to crates.io
 
 ## Error Handling
 

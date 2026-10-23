@@ -1,6 +1,9 @@
-.PHONY: build check test clippy clean
+.PHONY: build release check test clippy install publish clean
 
 build:
+	cargo build --release
+
+release: check
 	cargo build --release
 
 check: clippy test
@@ -10,6 +13,12 @@ clippy:
 
 test:
 	cargo test
+
+install:
+	cargo install --path .
+
+publish: check
+	cargo publish
 
 clean:
 	cargo clean
