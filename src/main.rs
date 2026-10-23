@@ -19,7 +19,7 @@
 //!   authenticated workflows and lightweight profile-like reuse.
 //! - `cmd_setup` detects installed Chromium browsers and checks debugging flag status.
 //! - `cmd_skill_install` writes the bundled SKILL.md (embedded via `include_str!`) to
-//!   `.claude/skills/chromium-bridge/SKILL.md` in the project root.
+//!   the selected harness's project skills directory.
 //!
 //! ## Agentic Contracts
 //! - All commands return `anyhow::Result<()>`; errors propagate to stderr.
@@ -57,14 +57,14 @@
 //! - state_save_named: `chromium-bridge state save linkedin-auth --tab linkedin` → writes JSON snapshot
 //! - state_load_named: `chromium-bridge state load linkedin-auth --tab linkedin` → restores cookies + storage
 //! - state_list: `chromium-bridge state list` → enumerates named snapshots
-//! - skill_install: `chromium-bridge skill install` → writes SKILL.md to project .claude/skills/
-//! - skill_check: `chromium-bridge skill check` → reports if installed version matches binary
+//! - skill_install: `chromium-bridge skill install --harness grok` → writes SKILL.md to project .grok/skills/
+//! - skill_check: `chromium-bridge skill check --harness grok` → reports if installed version matches binary
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use cdpkit::CDP;
 use chrono::Utc;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -239,7 +239,7 @@ enum Command {
         #[command(subcommand)]
         action: StateAction,
     },
-    /// Manage the Claude Code skill definition
+    /// Manage the agent harness skill definition
     Skill {
         #[command(subcommand)]
         action: SkillAction,
@@ -248,12 +248,48 @@ enum Command {
     Setup,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum SkillHarness {
+    Claude,
+    Codex,
+    Opencode,
+    Grok,
+}
+
+impl SkillHarness {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Opencode => "opencode",
+            Self::Grok => "grok",
+        }
+    }
+
+    fn skills_dir(self) -> &'static str {
+        match self {
+            Self::Claude => ".claude/skills",
+            Self::Codex => ".codex/skills",
+            Self::Opencode => ".opencode/skills",
+            Self::Grok => ".grok/skills",
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum SkillAction {
-    /// Install SKILL.md to .claude/skills/chromium-bridge/
-    Install,
+    /// Install SKILL.md for an agent harness
+    Install {
+        /// Agent harness whose project skill directory receives SKILL.md
+        #[arg(long, value_enum, default_value_t = SkillHarness::Claude)]
+        harness: SkillHarness,
+    },
     /// Check if installed skill matches this binary version
-    Check,
+    Check {
+        /// Agent harness whose installed skill is checked
+        #[arg(long, value_enum, default_value_t = SkillHarness::Claude)]
+        harness: SkillHarness,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2600,11 +2636,18 @@ fn resolve_skill_root() -> std::path::PathBuf {
     std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
 }
 
-fn cmd_skill_install(cli: &Cli) -> Result<()> {
+fn skill_path(root: &Path, harness: SkillHarness) -> PathBuf {
+    root.join(harness.skills_dir())
+        .join("chromium-bridge/SKILL.md")
+}
+
+fn cmd_skill_install(cli: &Cli, harness: SkillHarness) -> Result<()> {
     let root = resolve_skill_root();
-    let dir = root.join(".claude/skills/chromium-bridge");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join("SKILL.md");
+    let path = skill_path(&root, harness);
+    let dir = path
+        .parent()
+        .context("skill path has no parent directory")?;
+    std::fs::create_dir_all(dir)?;
 
     let already_current = path.exists()
         && std::fs::read_to_string(&path)
@@ -2616,6 +2659,7 @@ fn cmd_skill_install(cli: &Cli) -> Result<()> {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
+                    "harness": harness.as_str(),
                     "path": path.display().to_string(),
                     "updated": false,
                 }))?
@@ -2629,6 +2673,7 @@ fn cmd_skill_install(cli: &Cli) -> Result<()> {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
+                    "harness": harness.as_str(),
                     "path": path.display().to_string(),
                     "updated": true,
                 }))?
@@ -2640,9 +2685,9 @@ fn cmd_skill_install(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-fn cmd_skill_check(cli: &Cli) -> Result<()> {
+fn cmd_skill_check(cli: &Cli, harness: SkillHarness) -> Result<()> {
     let root = resolve_skill_root();
-    let path = root.join(".claude/skills/chromium-bridge/SKILL.md");
+    let path = skill_path(&root, harness);
 
     let up_to_date = path.exists()
         && std::fs::read_to_string(&path)
@@ -2653,6 +2698,7 @@ fn cmd_skill_check(cli: &Cli) -> Result<()> {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
+                "harness": harness.as_str(),
                 "path": path.display().to_string(),
                 "up_to_date": up_to_date,
             }))?
@@ -2661,11 +2707,17 @@ fn cmd_skill_check(cli: &Cli) -> Result<()> {
         println!("Skill up to date: {}", path.display());
     } else if path.exists() {
         eprintln!("Skill outdated: {}", path.display());
-        eprintln!("Run: chromium-bridge skill install");
+        eprintln!(
+            "Run: chromium-bridge skill install --harness {}",
+            harness.as_str()
+        );
         std::process::exit(1);
     } else {
         eprintln!("Skill not installed");
-        eprintln!("Run: chromium-bridge skill install");
+        eprintln!(
+            "Run: chromium-bridge skill install --harness {}",
+            harness.as_str()
+        );
         std::process::exit(1);
     }
     Ok(())
@@ -2739,6 +2791,56 @@ mod tests {
 
         assert_eq!(host.get_env(), Some(OsStr::new("CHROMIUM_BRIDGE_HOST")));
         assert_eq!(port.get_env(), Some(OsStr::new("CHROMIUM_BRIDGE_PORT")));
+    }
+
+    #[test]
+    fn skill_harness_paths_follow_harness_project_conventions() {
+        let root = Path::new("/workspace");
+        for (harness, expected) in [
+            (
+                SkillHarness::Claude,
+                "/workspace/.claude/skills/chromium-bridge/SKILL.md",
+            ),
+            (
+                SkillHarness::Codex,
+                "/workspace/.codex/skills/chromium-bridge/SKILL.md",
+            ),
+            (
+                SkillHarness::Opencode,
+                "/workspace/.opencode/skills/chromium-bridge/SKILL.md",
+            ),
+            (
+                SkillHarness::Grok,
+                "/workspace/.grok/skills/chromium-bridge/SKILL.md",
+            ),
+        ] {
+            assert_eq!(skill_path(root, harness), PathBuf::from(expected));
+        }
+    }
+
+    #[test]
+    fn skill_harness_defaults_to_claude_and_accepts_grok() {
+        let default = Cli::try_parse_from(["chromium-bridge", "skill", "install"])
+            .expect("default skill install should parse");
+        let grok = Cli::try_parse_from(["chromium-bridge", "skill", "check", "--harness", "grok"])
+            .expect("Grok skill check should parse");
+
+        assert!(matches!(
+            default.command,
+            Command::Skill {
+                action: SkillAction::Install {
+                    harness: SkillHarness::Claude
+                }
+            }
+        ));
+        assert!(matches!(
+            grok.command,
+            Command::Skill {
+                action: SkillAction::Check {
+                    harness: SkillHarness::Grok
+                }
+            }
+        ));
     }
 
     #[test]
@@ -3177,8 +3279,8 @@ async fn main() -> Result<()> {
             StateAction::List => cmd_state_list(&cli),
         },
         Command::Skill { action } => match action {
-            SkillAction::Install => cmd_skill_install(&cli),
-            SkillAction::Check => cmd_skill_check(&cli),
+            SkillAction::Install { harness } => cmd_skill_install(&cli, *harness),
+            SkillAction::Check { harness } => cmd_skill_check(&cli, *harness),
         },
         Command::Setup => cmd_setup(),
     }

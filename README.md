@@ -26,7 +26,7 @@ Works with **Brave**, **Chrome**, and **Chromium** — any browser that speaks C
 | `chromium-bridge state load <name>` | Restore cookies plus local/session storage |
 | `chromium-bridge state list` | List saved state snapshots |
 | `chromium-bridge setup` | Configure browser for remote debugging |
-| `chromium-bridge skill install` | Install SKILL.md to the project's Claude skills |
+| `chromium-bridge skill install [--harness <name>]` | Install SKILL.md for Claude, Codex, OpenCode, or Grok Build |
 
 All commands accept `--tab <index|pattern>` where applicable. The global `--host`, `--port`, `--timeout`, and `--json` options may appear before or after any subcommand. `CHROMIUM_BRIDGE_HOST` and `CHROMIUM_BRIDGE_PORT` provide per-shell endpoint defaults:
 
@@ -38,6 +38,18 @@ chromium-bridge list --port 9223
 # Configure wrappers without threading flags through them
 CHROMIUM_BRIDGE_PORT=9223 chromium-bridge check
 ```
+
+Install the bundled agent skill for a supported harness. Claude is the default
+for compatibility; select Grok Build explicitly with `--harness grok`:
+
+```bash
+chromium-bridge skill install --harness grok
+chromium-bridge skill check --harness grok
+```
+
+The supported harness names and project directories are `claude`
+(`.claude/skills`), `codex` (`.codex/skills`), `opencode`
+(`.opencode/skills`), and `grok` (`.grok/skills`).
 
 ## Accessibility Snapshot
 
@@ -160,6 +172,10 @@ irm https://raw.githubusercontent.com/btakita/chromium-bridge/main/install.ps1 |
 ```
 
 The PowerShell installer selects the x64 or ARM64 package, verifies its GitHub release digest, installs `chromium-bridge.exe` under `%LOCALAPPDATA%\Programs\chromium-bridge`, and adds that directory to the user `PATH`. Tagged releases ship prebuilt binaries for Windows, macOS, and Linux on `x86_64`/x64 and `aarch64`/ARM64.
+
+Maintainers can run `make release` for the checked release build and
+`make publish` to publish the current package version to crates.io. A pushed
+`v<version>` tag triggers the cross-platform GitHub release workflow.
 
 ## License
 
